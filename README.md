@@ -121,6 +121,25 @@ uv run vdt-eval-grid \
   --out-dir "$HOME/data/train/sdxl/samples/grid1"
 ```
 
+## GRPO / DDPO 风格后训练（实验性）
+
+在监督 LoRA 之后，可用 **`train_sdxl_grpo`** 做「每组 **G** 张 rollout → **ImageReward** + **百炼多模态 VQA（logprob → VQAScore 语义）** → 组内相对优势 → **DDIM 高斯 log-prob 的 DDPO 裁剪损失**」更新 UNet LoRA（见仓库内实现与 [Diffusers DDPO 说明](https://huggingface.co/docs/diffusers/training/ddpo)）。
+
+- **数据**：v3 JSONL，默认字段 **`prompt_en`**；**`judge_requirements.judge_questions`**（`question_en` / `expected_answer`）。实现中会**额外**增加一道英文整段题：*`Does this image reflect the following description: "{prompt_en}"? Please answer yes or no.`*（模板可用 `--global_question_template_en` 覆盖）。
+- **环境变量**：**`DASHSCOPE_API_KEY`**（百炼）；可选 **`VQA_MODEL`**（默认 `qwen3.5-35b-a3b`）。无密钥时用 **`--skip_vqa`** 仅跑 ImageReward（或两者都关：`--skip_vqa --skip_imagereward` 仅测管线）。
+- **显存**：约等于「SDXL 推理 × **G** + ImageReward + 反传」；可调小 **`--resolution`**、**`--group_size`**、**`--sample_num_steps`**、**`--train_timestep_fraction`**，并建议 **`--gradient_checkpointing`**。
+- **启动示例**：[scripts/launch_train_sdxl_grpo.sh](scripts/launch_train_sdxl_grpo.sh)（可按需改 `SDXL_BASE`、`GRPO_JSONL`、`SDXL_GRPO_OUTPUT`）。
+
+```bash
+chmod +x scripts/launch_train_sdxl_grpo.sh
+export DASHSCOPE_API_KEY="your-key"
+./scripts/launch_train_sdxl_grpo.sh \
+  --grpo_jsonl /path/to/train.jsonl \
+  --output_dir "$HOME/data/train/sdxl_grpo/run1"
+```
+
+- **可选 LoRA 起点**：**`--lora_path`** 指向此前保存的 **`unet_lora.safetensors`**（本脚本保存格式）或 Diffusers 兼容目录；**`--merge_lora_into_unet`** 会先融合再挂新 LoRA（显存更高，慎用）。
+
 ## 可选 CLIP 打分
 
 需为每张图提供 `manifest`（文件名与 prompt 对齐）时使用 `--manifest-json`。
