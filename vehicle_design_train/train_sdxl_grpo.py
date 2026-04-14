@@ -243,8 +243,6 @@ def main():
                 r_vqa_t,
                 args.weight_ir,
                 args.weight_vqa,
-                normalize_ir=True,
-                normalize_vqa=False,
             )
             advantages = compute_group_advantages(r_total.cpu()).to(device)
 
