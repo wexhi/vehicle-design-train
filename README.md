@@ -126,10 +126,18 @@ uv run vdt-eval-grid \
 在监督 LoRA 之后，可用 **`train_sdxl_grpo`** 做「每组 **G** 张 rollout → **ImageReward** + **百炼多模态 VQA（logprob → VQAScore 语义）** → 组内相对优势 → **DDIM 高斯 log-prob 的 DDPO 裁剪损失**」更新 UNet LoRA（见仓库内实现与 [Diffusers DDPO 说明](https://huggingface.co/docs/diffusers/training/ddpo)）。
 
 - **数据**：v3 JSONL，默认字段 **`prompt_en`**；**`judge_requirements.judge_questions`**（`question_en` / `expected_answer`）。实现中会**额外**增加一道英文整段题：*`Does this image reflect the following description: "{prompt_en}"? Please answer yes or no.`*（模板可用 `--global_question_template_en` 覆盖）。
-- **环境变量**：**`DASHSCOPE_API_KEY`**（百炼）；可选 **`VQA_MODEL`**（默认 `qwen3.5-35b-a3b`）。无密钥时用 **`--skip_vqa`** 仅跑 ImageReward（或两者都关：`--skip_vqa --skip_imagereward` 仅测管线）。
+- **环境变量**：**`DASHSCOPE_API_KEY`**（百炼）；可选 **`VQA_MODEL`**、**`VQA_MAX_WORKERS`**（并发 VQA 请求数，与 **`--vqa_max_workers`** 一致；同一组 **G** 张图上的 global + judge 题会打进同一线程池统一调度）。无密钥时用 **`--skip_vqa`** 仅跑 ImageReward（或两者都关：`--skip_vqa --skip_imagereward` 仅测管线）。
+- **本地 vLLM（Qwen3.5）**：在**单独目录**用 **uv venv** 安装 vLLM（勿与训练 venv 混用），见 [Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B)。可用仓库脚本一键启动（默认读取 **`$HOME/vllm-serve/.venv`**，可用 **`VLLM_ROOT` / `VLLM_VENV`** 覆盖）：  
+  `chmod +x scripts/launch_vllm_qwen35_grpo_vqa.sh && ./scripts/launch_vllm_qwen35_grpo_vqa.sh`  
+  等价于在独立 venv 中执行 `vllm serve`（默认 **`VLLM_MAX_MODEL_LEN=32768`** 省显存；满上下文可设 **`VLLM_MAX_MODEL_LEN=262144`** 等）。训练侧 **`--vqa_backend vllm_openai --vqa_model Qwen/Qwen3.5-9B`**，**`OPENAI_BASE_URL`** 指向 `http://127.0.0.1:8000/v1`（或 **`--vqa_openai_base_url`**），**`OPENAI_API_KEY`** 多为 **`EMPTY`**。默认关闭 Qwen3.5 thinking（便于 Yes/No 首 token logprob）；需要思维链时加 **`--vqa_enable_thinking`**。  
+  也可在项目根目录 **`.env`** 中写一行 `DASHSCOPE_API_KEY=你的密钥`（已在 `.gitignore`）：**`train_sdxl_grpo` 启动时会用 `python-dotenv` 加载**；用 **`scripts/launch_train_sdxl_grpo.sh`** 时脚本还会 **`source` 该 `.env`**，避免子进程拿不到变量。  
+  **双卡示例（GPU0 只跑 vLLM，GPU1 上 SDXL rollout+训练）**：终端 1：`VLLM_CUDA_VISIBLE_DEVICES=0 ./scripts/launch_vllm_qwen35_grpo_vqa.sh`；终端 2：`export GRPO_GPU_IDS=1 GRPO_NUM_PROCESSES=1 OPENAI_BASE_URL=http://127.0.0.1:8000/v1`，训练命令加 **`--vqa_backend vllm_openai --vqa_model Qwen/Qwen3.5-9B`**（模型名与 vLLM 一致）。**不要**设 **`GRPO_NUM_INFERENCE_PROCESSES`**（单卡用默认即可，脚本仅在多进程且显式设置时才启用 split）。
 - **显存**：约等于「SDXL 推理 × **G** + ImageReward + 反传」；可调小 **`--resolution`**、**`--group_size`**、**`--sample_num_steps`**、**`--train_timestep_fraction`**，并建议 **`--gradient_checkpointing`**。
-- **多卡分组（实验性）**：支持把进程拆成「前半组 rollout/reward，后半组 DDP 训练」，用于类似 LLM GRPO 的推理卡/训练卡分离。当前实现要求两组进程数相等；若样本数不能整除组数，会在每个 epoch 丢弃少量尾样本以保持 DDP 步数一致。
-- **启动示例**：[scripts/launch_train_sdxl_grpo.sh](scripts/launch_train_sdxl_grpo.sh)（可按需改 `SDXL_BASE`、`GRPO_JSONL`、`SDXL_GRPO_OUTPUT`）。
+- **Batch**：**`--rollout_batch_size`** 控制同一条 prompt 下 **一次 UNet 前向并行生成几张图**（推理显存随并行度上升）；**`--train_batch_size`** 控制 **DDPO 损失/反传时的微批大小**（与 rollout 独立）。`rollout_batch_size` 会自动不超过 **`group_size`**。
+- **多卡分组（实验性）**：支持把进程拆成「前半组 rollout/reward，后半组 DDP 训练」。当前实现要求 **推理进程数 == 训练进程数**（一对一配对）；若样本数不能整除组数，会在每个 epoch 丢弃少量尾样本。  
+  **不同物理 GPU**：在 **`--split_infer_train`** 下可设 **`GRPO_ROLLOUT_GPU_IDS`** 与 **`GRPO_TRAIN_GPU_IDS`**（或 **`--rollout_gpu_ids` / `--train_gpu_ids`**），逗号分隔、顺序与 rank 对应；每个进程在 `Accelerator` 之前单独 **`CUDA_VISIBLE_DEVICES`** 为一张卡。例：4 进程、2 推理 + 2 训练：`GRPO_ROLLOUT_GPU_IDS=2,3`，`GRPO_TRAIN_GPU_IDS=0,1`。非 split 时仍可用 **`GRPO_GPU_IDS`** 统一限制可见 GPU。  
+  （若想要「1 张 rollout + 多张 train」等非对称进程数，需改通信/配对逻辑，当前未支持。）
+- **启动示例**：[scripts/launch_train_sdxl_grpo.sh](scripts/launch_train_sdxl_grpo.sh)（可按需改 `SDXL_BASE`、`GRPO_JSONL`、`SDXL_GRPO_OUTPUT`）。非 split 时 **`GRPO_GPU_IDS`** 会 **`export CUDA_VISIBLE_DEVICES`**；split 且同时设 **`GRPO_TRAIN_GPU_IDS` + `GRPO_ROLLOUT_GPU_IDS`** 时由训练脚本按 rank 分配（勿再设 `GRPO_GPU_IDS`）。**`GRPO_NUM_PROCESSES`** 为 Accelerate 进程数。
 
 ```bash
 chmod +x scripts/launch_train_sdxl_grpo.sh
@@ -145,7 +153,9 @@ export DASHSCOPE_API_KEY="your-key"
 export DASHSCOPE_API_KEY="your-key"
 export GRPO_NUM_PROCESSES=4
 export GRPO_NUM_INFERENCE_PROCESSES=2
-CUDA_VISIBLE_DEVICES=0,1,2,3 ./scripts/launch_train_sdxl_grpo.sh \
+export GRPO_TRAIN_GPU_IDS=0,1
+export GRPO_ROLLOUT_GPU_IDS=2,3
+./scripts/launch_train_sdxl_grpo.sh \
   --grpo_jsonl /path/to/train.jsonl \
   --output_dir "$HOME/data/train/sdxl_grpo/run_split_2x2"
 ```

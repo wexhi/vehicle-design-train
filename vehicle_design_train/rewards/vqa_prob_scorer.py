@@ -1,83 +1,23 @@
 from __future__ import annotations
 
-import base64
-import io
 import json
 import logging
-import re
 import time
 from typing import Any, Optional
 
 from PIL import Image
 
-logger = logging.getLogger(__name__)
-
-DEFAULT_GLOBAL_TEMPLATE_EN = (
-    'Does this image reflect the following description: "{prompt}"? Please answer yes or no.'
+from vehicle_design_train.rewards.vqa_common import (
+    DEFAULT_GLOBAL_TEMPLATE_EN,
+    VqaRolloutGroupMixin,
+    _logprob_yes_from_structure,
+    pil_to_data_url_jpeg,
 )
 
+logger = logging.getLogger(__name__)
 
-def _pil_to_data_url_jpeg(image: Image.Image, quality: int = 92) -> str:
-    rgb = image.convert("RGB")
-    buf = io.BytesIO()
-    rgb.save(buf, format="JPEG", quality=quality)
-    b64 = base64.standard_b64encode(buf.getvalue()).decode("ascii")
-    return f"data:image/jpeg;base64,{b64}"
-
-
-def _norm_answer(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", s.strip().lower())
-
-
-def _expected_tokens(expected: str) -> list[str]:
-    e = _norm_answer(expected)
-    if e == "yes":
-        return ["yes", "y"]
-    if e == "no":
-        return ["no", "n"]
-    return [e]
-
-
-def _logprob_yes_from_structure(obj: Any, expected: str) -> Optional[float]:
-    """Read P(expected token) from nested logprob blobs (token + logprob fields)."""
-    import math
-
-    want = _expected_tokens(expected)
-    found: list[tuple[str, float]] = []
-
-    def walk(x: Any) -> None:
-        if x is None:
-            return
-        if isinstance(x, dict):
-            if "token" in x and "logprob" in x:
-                try:
-                    found.append((str(x["token"]), float(x["logprob"])))
-                except (TypeError, ValueError):
-                    pass
-            for v in x.values():
-                walk(v)
-        elif isinstance(x, list):
-            for v in x:
-                walk(v)
-
-    walk(obj)
-    if not found:
-        return None
-    by_tok: dict[str, float] = {}
-    for t, lp in found:
-        key = _norm_answer(t)
-        by_tok[key] = max(by_tok.get(key, float("-inf")), lp)
-    rel = [k for k in by_tok if k in want]
-    if not rel:
-        pool = list(by_tok.keys())
-        rel = pool
-    m = max(by_tok[k] for k in rel)
-    exps = {k: math.exp(by_tok[k] - m) for k in rel}
-    z = sum(exps.values())
-    num = sum(exps[k] for k in rel if k in want)
-    if num == 0.0:
-        return None
-    return float(num / z)
+# Back-compat re-exports
+__all__ = ["DEFAULT_GLOBAL_TEMPLATE_EN", "DashScopeVqaProbScorer"]
 
 
 def _message_content(resp: Any) -> str:
@@ -124,7 +64,7 @@ def _choice_logprob_blob(resp: Any) -> Any:
     return getattr(c0, "logprobs", None)
 
 
-class DashScopeVqaProbScorer:
+class DashScopeVqaProbScorer(VqaRolloutGroupMixin):
     """VQAScore-style scores via DashScope multimodal API (user-confirmed logprobs available)."""
 
     def __init__(
@@ -139,6 +79,9 @@ class DashScopeVqaProbScorer:
         retry_backoff_sec: float = 2.0,
         retry_max_backoff_sec: float = 30.0,
         extra_call_kwargs: Optional[dict[str, Any]] = None,
+        request_logprobs: bool = True,
+        top_logprobs: int = 5,
+        max_workers: int = 8,
     ):
         from dashscope import MultiModalConversation
 
@@ -153,9 +96,12 @@ class DashScopeVqaProbScorer:
         self.retry_backoff_sec = retry_backoff_sec
         self.retry_max_backoff_sec = retry_max_backoff_sec
         self.extra_call_kwargs = extra_call_kwargs or {}
+        self.request_logprobs = request_logprobs
+        self.top_logprobs = max(0, min(5, int(top_logprobs)))
+        self.max_workers = max(1, int(max_workers))
 
     def _call_once(self, image: Image.Image, question: str) -> Any:
-        data_url = _pil_to_data_url_jpeg(image)
+        data_url = pil_to_data_url_jpeg(image)
         messages = [
             {
                 "role": "system",
@@ -169,10 +115,12 @@ class DashScopeVqaProbScorer:
                 ],
             },
         ]
-        kwargs = {
-            "max_tokens": self.max_tokens,
-            **self.extra_call_kwargs,
-        }
+        kwargs: dict[str, Any] = {"max_tokens": self.max_tokens}
+        if self.request_logprobs:
+            kwargs["result_format"] = "message"
+            kwargs["logprobs"] = True
+            kwargs["top_logprobs"] = self.top_logprobs
+        kwargs.update(self.extra_call_kwargs)
         return self._mmc.call(model=self.model, messages=messages, api_key=self.api_key, **kwargs)
 
     def _should_retry_status(self, status_code: Optional[int]) -> bool:
@@ -247,7 +195,6 @@ class DashScopeVqaProbScorer:
             detail["prob_source"] = "logprobs"
             return float(prob), detail
 
-        # Try raw JSON dump for nested logprobs keys (API variants)
         try:
             raw = json.loads(json.dumps(resp.output, default=lambda o: o.__dict__ if hasattr(o, "__dict__") else str(o)))
             prob = _logprob_yes_from_structure(raw, expected_answer)
@@ -264,35 +211,3 @@ class DashScopeVqaProbScorer:
             detail["text"][:200],
         )
         return 0.0, detail
-
-    def score_sample(
-        self,
-        image: Image.Image,
-        prompt_en: str,
-        judge_questions: Optional[list[dict[str, Any]]],
-    ) -> tuple[float, dict[str, Any]]:
-        """Global English question + dataset judge_questions; weighted mean probability."""
-        judges = list(judge_questions or [])
-        global_q = self.global_question_template_en.format(prompt=prompt_en)
-
-        items: list[tuple[float, float, str]] = []
-        g_prob, g_det = self.score_one_question(image, global_q, "yes", meta="global")
-        items.append((g_prob, self.global_weight, "global"))
-
-        details: dict[str, Any] = {"global": g_det, "judges": []}
-        for i, jq in enumerate(judges):
-            q = jq.get("question_en") or jq.get("question")
-            exp = str(jq.get("expected_answer", "yes")).strip()
-            if not q:
-                logger.warning("Skipping judge %d: missing question_en", i)
-                details["judges"].append({"skipped": True})
-                continue
-            p, d = self.score_one_question(image, q, exp, meta=f"judge_{i}")
-            items.append((p, self.judge_weight, f"judge_{i}"))
-            details["judges"].append(d)
-
-        wsum = sum(w for _, w, _ in items)
-        if wsum <= 0:
-            return 0.0, details
-        r_vqa = sum(p * w for p, w, _ in items) / wsum
-        return float(r_vqa), details

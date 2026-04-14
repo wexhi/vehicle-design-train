@@ -5,6 +5,7 @@ from typing import Any
 import torch
 
 from vehicle_design_train.grpo.ddim_logprob import ddim_step_with_logprob
+from vehicle_design_train.grpo.ddp_utils import unwrap_unet
 
 
 def sdxl_ddpo_calculate_loss(
@@ -49,11 +50,12 @@ def sdxl_ddpo_calculate_loss(
         add_text_embeds = pooled_prompt_embeds.repeat(b, 1)
         add_time_ids_b = add_time_ids.to(device).repeat(b, 1)
 
+    unet_cfg = unwrap_unet(pipe.unet).config
     timestep_cond = None
-    if pipe.unet.config.time_cond_proj_dim is not None:
+    if unet_cfg.time_cond_proj_dim is not None:
         gst = torch.tensor(guidance_scale - 1, device=device, dtype=latents.dtype).repeat(b)
         timestep_cond = pipe.get_guidance_scale_embedding(
-            gst, embedding_dim=pipe.unet.config.time_cond_proj_dim
+            gst, embedding_dim=unet_cfg.time_cond_proj_dim
         ).to(dtype=latents.dtype)
 
     with autocast_cm:
