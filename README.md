@@ -128,6 +128,7 @@ uv run vdt-eval-grid \
 - **数据**：v3 JSONL，默认字段 **`prompt_en`**；**`judge_requirements.judge_questions`**（`question_en` / `expected_answer`）。实现中会**额外**增加一道英文整段题：*`Does this image reflect the following description: "{prompt_en}"? Please answer yes or no.`*（模板可用 `--global_question_template_en` 覆盖）。
 - **环境变量**：**`DASHSCOPE_API_KEY`**（百炼）；可选 **`VQA_MODEL`**（默认 `qwen3.5-35b-a3b`）。无密钥时用 **`--skip_vqa`** 仅跑 ImageReward（或两者都关：`--skip_vqa --skip_imagereward` 仅测管线）。
 - **显存**：约等于「SDXL 推理 × **G** + ImageReward + 反传」；可调小 **`--resolution`**、**`--group_size`**、**`--sample_num_steps`**、**`--train_timestep_fraction`**，并建议 **`--gradient_checkpointing`**。
+- **多卡分组（实验性）**：支持把进程拆成「前半组 rollout/reward，后半组 DDP 训练」，用于类似 LLM GRPO 的推理卡/训练卡分离。当前实现要求两组进程数相等；若样本数不能整除组数，会在每个 epoch 丢弃少量尾样本以保持 DDP 步数一致。
 - **启动示例**：[scripts/launch_train_sdxl_grpo.sh](scripts/launch_train_sdxl_grpo.sh)（可按需改 `SDXL_BASE`、`GRPO_JSONL`、`SDXL_GRPO_OUTPUT`）。
 
 ```bash
@@ -136,6 +137,17 @@ export DASHSCOPE_API_KEY="your-key"
 ./scripts/launch_train_sdxl_grpo.sh \
   --grpo_jsonl /path/to/train.jsonl \
   --output_dir "$HOME/data/train/sdxl_grpo/run1"
+```
+
+四卡示例（2 卡推理 + 2 卡训练）：
+
+```bash
+export DASHSCOPE_API_KEY="your-key"
+export GRPO_NUM_PROCESSES=4
+export GRPO_NUM_INFERENCE_PROCESSES=2
+CUDA_VISIBLE_DEVICES=0,1,2,3 ./scripts/launch_train_sdxl_grpo.sh \
+  --grpo_jsonl /path/to/train.jsonl \
+  --output_dir "$HOME/data/train/sdxl_grpo/run_split_2x2"
 ```
 
 - **可选 LoRA 起点**：**`--lora_path`** 指向此前保存的 **`unet_lora.safetensors`**（本脚本保存格式）或 Diffusers 兼容目录；**`--merge_lora_into_unet`** 会先融合再挂新 LoRA（显存更高，慎用）。
