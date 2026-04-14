@@ -1,0 +1,36 @@
+{
+  "prompts": [
+    {
+      "id": "audi_wagon_front34",
+      "text": "Audi A4 Allroad wagon, front three-quarter view, metallic blue paint, split headlights, large grille, sloping roofline, multi-spoke alloy wheels, urban cobblestone, outdoor photo, high detail"
+    },
+    {
+      "id": "bmw_sedan_side",
+      "text": "BMW 3 Series sedan, pure side profile, alpine white, M sport package, black kidney grille, shadowline trim, low stance, multi-spoke black wheels, studio lighting, photorealistic"
+    },
+    {
+      "id": "mercedes_suv_front",
+      "text": "Mercedes-Benz GLE SUV, front view, iridium silver metallic, large star emblem, LED digital light headlights, panoramic roof, chrome accents, clean plain background, luxury photo"
+    },
+    {
+      "id": "vw_hatch_rear34_detail",
+      "text": "Volkswagen dark grey hatchback, rear three-quarter view, full-width continuous LED tail light bar spanning the tailgate, black alloy wheels, subtle roof spoiler, sharp body creases, clean studio background, photo, high detail"
+    },
+    {
+      "id": "audi_concept_low",
+      "text": "Audi concept coupe, low-slung stance, frameless doors, aggressive front fascia, laser-thin headlights, large air intakes, matte grey wrap, motor show floor, render-style lighting"
+    },
+    {
+      "id": "bmw_suv_front_street",
+      "text": "BMW X5 SUV, front three-quarter, Brooklyn grey, laser headlights, upright kidney grille, urban street scene, wet asphalt reflections, dusk lighting, photo"
+    },
+    {
+      "id": "mercedes_sedan_night",
+      "text": "Mercedes-Benz E-Class sedan, front three-quarter, obsidian black, AMG line, diamond grille, multibeam LED, city night scene, bokeh lights, cinematic photo"
+    },
+    {
+      "id": "vw_id_crossover",
+      "text": "Volkswagen ID family electric crossover, side view, glacier white, closed grille, aerodynamic two-tone roof, slim LED light strip, aero wheels, minimal studio, modern EV design language, photo"
+    }
+  ]
+}
