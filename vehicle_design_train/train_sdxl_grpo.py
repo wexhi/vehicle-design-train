@@ -4,10 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import math
 import os
+import re
+import shutil
 import random
 import time
 from contextlib import nullcontext
@@ -221,11 +224,32 @@ def parse_args():
         default=1,
         help="Micro-batch size for DDPO loss / optimizer.step (independent from rollout_batch_size)",
     )
+    p.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=1,
+        help="Accumulate this many micro-batch backward passes before each optimizer.step (standard mode uses Accelerate; split DDP uses no_sync + scaled loss).",
+    )
     p.add_argument("--train_cfg", action="store_true", default=True)
     p.add_argument("--no_train_cfg", action="store_false", dest="train_cfg")
     p.add_argument("--train_clip_range", type=float, default=1e-4)
     p.add_argument("--train_adv_clip_max", type=float, default=5.0)
     p.add_argument("--train_timestep_fraction", type=float, default=0.25, help="Fraction of denoise steps used in policy update")
+    p.add_argument(
+        "--train_timestep_sample_mode",
+        type=str,
+        default="group_shared_stratified",
+        choices=["independent", "group_shared_uniform", "group_shared_stratified"],
+        help="How to pick DDPO timestep indices: independent=per-rollout randperm (legacy); "
+        "group_shared_*=same K indices for the whole GRPO group (lower variance). "
+        "Stratified splits trajectory index ~high/mid/low noise then samples within each bucket.",
+    )
+    p.add_argument(
+        "--train_timestep_unbiased_scale",
+        action="store_true",
+        help="If set with --train_timestep_sample_mode=group_shared_uniform and K<T, scale DDPO loss/approx_kl by T/K "
+        "(Monte Carlo correction toward full-trajectory sum; not valid for stratified).",
+    )
     p.add_argument("--train_num_inner_epochs", type=int, default=1)
     p.add_argument("--weight_ir", type=float, default=0.5)
     p.add_argument("--weight_vqa", type=float, default=0.5)
@@ -295,12 +319,50 @@ def parse_args():
     )
     p.add_argument("--logging_steps", type=int, default=1)
     p.add_argument("--save_steps", type=int, default=50)
-    p.add_argument("--log_image_steps", type=int, default=0, help="If > 0, log rollout images to TensorBoard/local disk every N optimizer steps")
-    p.add_argument("--max_logged_images", type=int, default=4, help="Max rollout images to log/save per image logging step")
+    p.add_argument(
+        "--log_image_steps",
+        type=int,
+        default=0,
+        help="If > 0, every N optimizer steps log per-rollout r_total/r_ir/r_vqa/advantage (JSON under rollout_samples/ + TB text/scalars).",
+    )
+    p.add_argument(
+        "--save_rollout_sample_images",
+        action="store_true",
+        help="With --log_image_steps>0, also save PNGs and TensorBoard image panels (capped by --max_logged_images). Default: metrics only, no images.",
+    )
+    p.add_argument("--max_logged_images", type=int, default=4, help="Max rollout images to save/log to TB when --save_rollout_sample_images is set")
+    p.add_argument(
+        "--checkpointing_steps",
+        type=int,
+        default=0,
+        help="If > 0, save checkpoint-{step}/ (unet_lora.safetensors + training_state.pt with optimizer + resume cursor) every N global optimizer steps. 0 = disabled.",
+    )
+    p.add_argument(
+        "--checkpoints_total_limit",
+        type=int,
+        default=None,
+        help="Max number of checkpoint-* dirs to keep (oldest removed when saving). None = unlimited.",
+    )
+    p.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help='Resume LoRA + optimizer + global_step + epoch/sample offset from this dir, or "latest" under --output_dir.',
+    )
     return p.parse_args()
 
 
-def load_pipeline(args, device: str, torch_dtype: torch.dtype):
+@dataclass
+class ResumeState:
+    """Training cursor + optimizer state loaded from checkpoint (optimizer dict applied after prepare)."""
+
+    global_step: int
+    epoch: int
+    sample_idx_in_epoch: int
+    optimizer_state: dict
+
+
+def load_pipeline(args, device: str, torch_dtype: torch.dtype, lora_path_override: str | None = None):
     pipe = StableDiffusionXLPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         torch_dtype=torch_dtype,
@@ -326,8 +388,8 @@ def load_pipeline(args, device: str, torch_dtype: torch.dtype):
     )
     pipe.unet = get_peft_model(pipe.unet, lora_config)
 
-    if args.lora_path:
-        lp = args.lora_path
+    lp = lora_path_override if lora_path_override is not None else args.lora_path
+    if lp:
         if lp.endswith(".safetensors"):
             from peft import set_peft_model_state_dict
             from safetensors.torch import load_file
@@ -448,6 +510,30 @@ def log_tensorboard_scalars(tb_writer: SummaryWriter | None, names: list[str], v
         tb_writer.add_scalar(name, value, global_step)
 
 
+def _log_grpo_step_console(
+    global_step: int,
+    rollout_metrics: torch.Tensor | None,
+    train_metrics: torch.Tensor | None,
+) -> None:
+    """Print a one-line summary to the terminal (same ranks / cadence as TensorBoard)."""
+    parts: list[str] = [f"step={global_step}"]
+    if train_metrics is not None:
+        tm = train_metrics.detach().float().cpu()
+        parts.append(f"loss={tm[0].item():.6f}")
+        parts.append(f"approx_kl={tm[1].item():.6f}")
+        parts.append(f"clipfrac={tm[2].item():.4f}")
+        parts.append(f"lr={tm[4].item():.2e}")
+    if rollout_metrics is not None:
+        rm = rollout_metrics.detach().float().cpu()
+        parts.append(f"reward_mean={rm[0].item():.4f}")
+        parts.append(f"reward_std={rm[1].item():.4f}")
+        parts.append(f"r_ir_mean={rm[5].item():.4f}")
+        parts.append(f"r_vqa_mean={rm[9].item():.4f}")
+        parts.append(f"adv_mean={rm[13].item():.4f}")
+        parts.append(f"rollout_sec={rm[21].item():.2f}")
+    logger.info("[GRPO] %s", " | ".join(parts))
+
+
 def maybe_log_step_scalars(
     tb_writer: SummaryWriter | None,
     global_step: int,
@@ -455,14 +541,15 @@ def maybe_log_step_scalars(
     rollout_metrics: torch.Tensor | None = None,
     train_metrics: torch.Tensor | None = None,
 ) -> None:
-    if tb_writer is None:
-        return
     if global_step % max(logging_steps, 1) != 0:
+        return
+    if tb_writer is None:
         return
     if rollout_metrics is not None:
         log_tensorboard_scalars(tb_writer, _ROLLOUT_METRIC_NAMES, rollout_metrics, global_step)
     if train_metrics is not None:
         log_tensorboard_scalars(tb_writer, _TRAIN_METRIC_NAMES, train_metrics, global_step)
+    _log_grpo_step_console(global_step, rollout_metrics, train_metrics)
 
 
 def log_run_config(tb_writer: SummaryWriter | None, args, accelerator: Accelerator, split_cfg: SplitRoleConfig) -> None:
@@ -475,12 +562,15 @@ def log_run_config(tb_writer: SummaryWriter | None, args, accelerator: Accelerat
         "config/sample_guidance_scale": float(args.sample_guidance_scale),
         "config/rollout_batch_size": float(args.rollout_batch_size),
         "config/train_batch_size": float(args.train_batch_size),
+        "config/gradient_accumulation_steps": float(max(1, int(args.gradient_accumulation_steps))),
         "config/train_timestep_fraction": float(args.train_timestep_fraction),
+        "config/train_timestep_unbiased_scale": 1.0 if args.train_timestep_unbiased_scale else 0.0,
         "config/train_num_inner_epochs": float(args.train_num_inner_epochs),
         "config/train_learning_rate": float(args.train_learning_rate),
         "config/train_clip_range": float(args.train_clip_range),
         "config/train_adv_clip_max": float(args.train_adv_clip_max),
         "config/log_image_steps": float(args.log_image_steps),
+        "config/save_rollout_sample_images": 1.0 if args.save_rollout_sample_images else 0.0,
         "config/max_logged_images": float(args.max_logged_images),
         "config/weight_ir": float(args.weight_ir),
         "config/weight_vqa": float(args.weight_vqa),
@@ -504,6 +594,11 @@ def log_run_config(tb_writer: SummaryWriter | None, args, accelerator: Accelerat
         (args.rollout_gpu_ids or os.environ.get("GRPO_ROLLOUT_GPU_IDS") or "").strip(),
         0,
     )
+    tb_writer.add_text("config/train_timestep_sample_mode", args.train_timestep_sample_mode, 0)
+    tb_writer.add_scalar("config/checkpointing_steps", float(args.checkpointing_steps), 0)
+    if args.checkpoints_total_limit is not None:
+        tb_writer.add_scalar("config/checkpoints_total_limit", float(args.checkpoints_total_limit), 0)
+    tb_writer.add_text("config/resume_from_checkpoint", args.resume_from_checkpoint or "", 0)
 
 
 def setup_split_roles(args, accelerator: Accelerator) -> SplitRoleConfig:
@@ -556,9 +651,11 @@ def setup_split_roles(args, accelerator: Accelerator) -> SplitRoleConfig:
 
 
 def optimizer_steps_per_sample(args, num_train_steps: int) -> int:
-    """DDPO inner loop: micro-batches over (group_size * num_train_steps) latents × inner_epochs."""
+    """DDPO inner loop: count of optimizer.step() per sample (after gradient accumulation)."""
     flat_n = int(args.group_size) * int(num_train_steps)
-    return int(args.train_num_inner_epochs) * math.ceil(flat_n / max(1, int(args.train_batch_size)))
+    micro = int(args.train_num_inner_epochs) * math.ceil(flat_n / max(1, int(args.train_batch_size)))
+    acc = max(1, int(args.gradient_accumulation_steps))
+    return math.ceil(micro / acc)
 
 
 def print_training_startup_config(
@@ -569,6 +666,8 @@ def print_training_startup_config(
     num_samples: int,
     torch_dtype: torch.dtype,
     device: torch.device,
+    resume_state: ResumeState | None = None,
+    resume_ckpt_dir: str | None = None,
 ) -> None:
     if not accelerator.is_main_process:
         return
@@ -587,6 +686,12 @@ def print_training_startup_config(
         eta_warn = (
             "  WARNING: sample_eta<=0 时 DDIM 退化为确定性步，当前 log_prob 目标对 UNet 无梯度；"
             "请使用 sample_eta>0（默认 1.0）。"
+        )
+    ts_mode_warn = ""
+    if args.train_timestep_unbiased_scale and args.train_timestep_sample_mode != "group_shared_uniform":
+        ts_mode_warn = (
+            "  WARNING: train_timestep_unbiased_scale 仅对 group_shared_uniform + K<T 生效；"
+            f"当前 mode={args.train_timestep_sample_mode}，将不乘 T/K。"
         )
     lines = [
         "=" * 72,
@@ -613,9 +718,13 @@ def print_training_startup_config(
         f"  sample_num_steps:        {args.sample_num_steps}  eta={args.sample_eta}  guidance={args.sample_guidance_scale}",
         *([eta_warn] if eta_warn else []),
         f"  train_timestep_fraction: {args.train_timestep_fraction}  -> num_train_steps={num_train_steps}",
+        f"  train_timestep_sample_mode: {args.train_timestep_sample_mode}",
+        f"  train_timestep_unbiased_scale: {args.train_timestep_unbiased_scale}  (T/K loss scale only if uniform+K<T; may need LR retune)",
+        *([ts_mode_warn] if ts_mode_warn else []),
         f"  train_batch_size:        {args.train_batch_size}",
+        f"  gradient_accumulation:   {max(1, int(args.gradient_accumulation_steps))}",
         f"  train_num_inner_epochs:  {args.train_num_inner_epochs}",
-        f"  optimizer_steps/sample:  {steps_per_sample}  (= inner_epochs × ceil(G×Ttrain / train_batch_size))",
+        f"  optimizer_steps/sample:  {steps_per_sample}  (= ceil(inner_epochs × ceil(G×Ttrain / train_batch_size) / grad_acc))",
         opt_epoch_line,
         f"  train_learning_rate:     {args.train_learning_rate}",
         f"  gradient_checkpointing:  {bool(args.gradient_checkpointing)}",
@@ -630,8 +739,20 @@ def print_training_startup_config(
         f"  vqa_backend:             {args.vqa_backend}  model={args.vqa_model}",
         "-" * 72,
         f"  save_steps:              {args.save_steps}",
+        f"  checkpointing_steps:     {args.checkpointing_steps}  (0=关闭; 每 N 个全局 optimizer step 存 checkpoint-{{step}}/)",
+        f"  checkpoints_total_limit: {args.checkpoints_total_limit}",
+        f"  resume_from_checkpoint:  {args.resume_from_checkpoint or '(none)'}",
+        *(
+            [
+                f"  → resume 已解析:         {resume_ckpt_dir}  "
+                f"(global_step={resume_state.global_step} epoch={resume_state.epoch} "
+                f"sample_idx_in_epoch={resume_state.sample_idx_in_epoch})"
+            ]
+            if resume_state is not None and resume_ckpt_dir
+            else []
+        ),
         f"  logging_steps:           {args.logging_steps}",
-        f"  log_image_steps:         {args.log_image_steps}  max_logged_images={args.max_logged_images}",
+        f"  log_image_steps:         {args.log_image_steps}  save_rollout_sample_images={args.save_rollout_sample_images}  max_logged_images={args.max_logged_images}",
         f"  num_epochs:              {args.num_epochs}",
         f"  seed:                    {args.seed}",
         f"  negative_prompt:         {(args.negative_prompt or '(empty)')[:120]}{'…' if len(args.negative_prompt or '') > 120 else ''}",
@@ -662,6 +783,26 @@ def epoch_samples_for_rank(
 
 def get_unet_module(unet):
     return unet.module if isinstance(unet, DDP) else unet
+
+
+def _ddp_no_sync_if(unet, active: bool):
+    """Skip gradient all-reduce on DDP backward when still accumulating."""
+    if active and isinstance(unet, DDP):
+        return unet.no_sync()
+    return nullcontext()
+
+
+def _ddpo_subsample_loss_scale(args, num_train_steps: int) -> float:
+    """Monte Carlo scale T/K for uniform subsample (group_shared_uniform only); split-safe via args."""
+    T = int(args.sample_num_steps)
+    K = int(num_train_steps)
+    if (
+        args.train_timestep_unbiased_scale
+        and args.train_timestep_sample_mode == "group_shared_uniform"
+        and K < T
+    ):
+        return T / float(K)
+    return 1.0
 
 
 def _trainable_grad_l2_norm(unet: torch.nn.Module) -> tuple[float, int]:
@@ -723,6 +864,96 @@ def sync_trainable_params(unet, peer_rank: int, send: bool) -> None:
             recv_buf = torch.empty_like(param.data)
             dist.recv(recv_buf, peer_rank)
             param.data.copy_(recv_buf)
+
+
+def _prompt_subseed(prompt: str) -> int:
+    return int(hashlib.md5(prompt.encode("utf-8")).hexdigest()[:8], 16)
+
+
+def _stratified_timestep_indices(T: int, K: int, gen_cpu: torch.Generator, device: torch.device) -> torch.Tensor:
+    """
+    Sample K distinct indices from [0, T) with quotas across three trajectory segments.
+    Index 0 is the first denoising transition (typically higher noise); T-1 is the last.
+    """
+    if K >= T:
+        row = torch.randperm(T, generator=gen_cpu, device="cpu")[:K]
+        return row.to(device=device, dtype=torch.long)
+
+    t1 = max(1, T // 3)
+    t2 = max(t1 + 1, (2 * T) // 3)
+    if t2 >= T:
+        t2 = T - 1
+    segs = [
+        list(range(0, t1)),
+        list(range(t1, t2)),
+        list(range(t2, T)),
+    ]
+    segs = [s for s in segs if len(s) > 0]
+    if not segs:
+        row = torch.randperm(T, generator=gen_cpu, device="cpu")[:K]
+        return row.to(device=device, dtype=torch.long)
+
+    nseg = len(segs)
+    base = K // nseg
+    rem = K - base * nseg
+    quotas = [base + (1 if i < rem else 0) for i in range(nseg)]
+    picked: list[int] = []
+    for seg, q in zip(segs, quotas):
+        if q <= 0:
+            continue
+        take = min(q, len(seg))
+        perm = torch.randperm(len(seg), generator=gen_cpu, device="cpu")[:take]
+        st = torch.tensor(seg, dtype=torch.long)
+        picked.extend(st[perm].tolist())
+
+    if len(picked) < K:
+        used = set(picked)
+        pool = [i for i in range(T) if i not in used]
+        need = K - len(picked)
+        if need > 0 and pool:
+            pt = torch.tensor(pool, dtype=torch.long)
+            perm = torch.randperm(len(pool), generator=gen_cpu, device="cpu")[:need]
+            picked.extend(pt[perm].tolist())
+
+    idx_cpu = torch.tensor(picked[:K], dtype=torch.long)
+    shuf = torch.randperm(len(idx_cpu), generator=gen_cpu)
+    return idx_cpu[shuf].to(device=device, dtype=torch.long)
+
+
+def sample_ddpo_train_timestep_indices(
+    *,
+    T: int,
+    K: int,
+    G: int,
+    mode: str,
+    device: torch.device,
+    seed: int,
+) -> torch.Tensor:
+    """Return indices [G, K] into rollout steps 0..T-1 (latents slice)."""
+    K = min(max(K, 1), T)
+    gen_cpu = torch.Generator(device="cpu")
+    gen_cpu.manual_seed(int(seed) & 0x7FFF_FFFF_FFFF_FFFF)
+
+    if K >= T:
+        row = torch.randperm(T, generator=gen_cpu, device="cpu")[:K].to(device=device, dtype=torch.long)
+        return row.unsqueeze(0).expand(G, -1).contiguous()
+
+    if mode == "independent":
+        out = torch.empty((G, K), device=device, dtype=torch.long)
+        for i in range(G):
+            gen_cpu.manual_seed((int(seed) + i + 1) & 0x7FFF_FFFF_FFFF_FFFF)
+            out[i] = torch.randperm(T, generator=gen_cpu, device="cpu")[:K].to(device=device, dtype=torch.long)
+        return out
+
+    if mode == "group_shared_uniform":
+        row = torch.randperm(T, generator=gen_cpu, device="cpu")[:K].to(device=device, dtype=torch.long)
+        return row.unsqueeze(0).expand(G, -1).contiguous()
+
+    if mode == "group_shared_stratified":
+        row = _stratified_timestep_indices(T, K, gen_cpu, device)
+        return row.unsqueeze(0).expand(G, -1).contiguous()
+
+    raise ValueError(f"Unknown train_timestep_sample_mode: {mode}")
 
 
 def build_rollout_training_batch(
@@ -790,8 +1021,16 @@ def build_rollout_training_batch(
 
     stacked = stack_rollouts(results)
     G, T, _c, _h, _w = stacked["latents"].shape
-    perm_steps = torch.stack([torch.randperm(T, device=device) for _ in range(G)])
-    idx = perm_steps[:, :num_train_steps]
+    K = min(max(num_train_steps, 1), T)
+    idx_seed = int(args.seed) + int(global_step) * 1_000_003 + _prompt_subseed(prompt)
+    idx = sample_ddpo_train_timestep_indices(
+        T=T,
+        K=K,
+        G=G,
+        mode=args.train_timestep_sample_mode,
+        device=device,
+        seed=idx_seed,
+    )
     rollout_sec = time.perf_counter() - rollout_start
 
     return {
@@ -876,63 +1115,63 @@ def sanitize_filename(text: str, limit: int = 80) -> str:
     return (safe[:limit] or "prompt").rstrip("_")
 
 
-def log_rollout_images(
+def log_rollout_group_reward_advantage(
     tb_writer: SummaryWriter | None,
     output_dir: Path,
     global_step: int,
-    images: list[Image.Image],
-    prompt: str,
-    max_logged_images: int,
+    prompt: str | None,
     r_total: torch.Tensor,
     r_ir: torch.Tensor,
     r_vqa: torch.Tensor,
     advantages: torch.Tensor,
+    *,
+    write_disk: bool,
 ) -> None:
-    if not images or max_logged_images <= 0:
-        return
-
-    g = len(images)
-    n = min(g, max_logged_images, int(r_total.shape[0]), int(advantages.shape[0]))
+    """Log full rollout group: per-image r_total, r_ir, r_vqa, advantage (JSON + TB text/scalars). No image tensors."""
+    n = min(
+        int(r_total.shape[0]),
+        int(r_ir.shape[0]),
+        int(r_vqa.shape[0]),
+        int(advantages.shape[0]),
+    )
     if n <= 0:
         return
 
-    chosen = images[:n]
     rt = r_total.detach().float().cpu()[:n]
     ri = r_ir.detach().float().cpu()[:n]
     rv = r_vqa.detach().float().cpu()[:n]
     adv = advantages.detach().float().cpu()[:n]
 
-    prompt_tag = sanitize_filename(prompt)
     rollout_dir = output_dir / "rollout_samples" / f"step_{global_step:08d}"
-    rollout_dir.mkdir(parents=True, exist_ok=True)
+    resolved = (prompt or "").strip()
+    if not resolved:
+        ppt = rollout_dir / "prompt.txt"
+        if ppt.is_file():
+            resolved = ppt.read_text(encoding="utf-8").strip()
+    if not resolved:
+        resolved = "(unknown prompt)"
 
-    tensors = []
-    rows: list[dict[str, float | int]] = []
-    for idx, image in enumerate(chosen):
-        save_path = rollout_dir / f"{idx:02d}_{prompt_tag}.png"
-        image.save(save_path)
-        if tb_writer is not None:
-            tensors.append(pil_to_tensor(image.convert("RGB")).float() / 255.0)
-        rows.append(
-            {
-                "index": idx,
-                "r_total": float(rt[idx].item()),
-                "r_ir": float(ri[idx].item()),
-                "r_vqa": float(rv[idx].item()),
-                "advantage": float(adv[idx].item()),
-            }
-        )
+    rows: list[dict[str, float | int]] = [
+        {
+            "index": i,
+            "r_total": float(rt[i].item()),
+            "r_ir": float(ri[i].item()),
+            "r_vqa": float(rv[i].item()),
+            "advantage": float(adv[i].item()),
+        }
+        for i in range(n)
+    ]
 
-    prompt_path = rollout_dir / "prompt.txt"
-    prompt_path.write_text(prompt, encoding="utf-8")
-    (rollout_dir / "per_image_metrics.json").write_text(json.dumps(rows, indent=2), encoding="utf-8")
+    if write_disk:
+        rollout_dir.mkdir(parents=True, exist_ok=True)
+        (rollout_dir / "prompt.txt").write_text(resolved, encoding="utf-8")
+        (rollout_dir / "per_image_metrics.json").write_text(json.dumps(rows, indent=2), encoding="utf-8")
 
     if tb_writer is not None:
-        # TEXT 面板：展开左侧「TEXT」查看；IMAGES 默认不显示标量。
         table_lines = [
             "### Prompt",
             "```",
-            prompt,
+            resolved,
             "```",
             "",
             "| # | r_total | r_ir | r_vqa | advantage |",
@@ -952,6 +1191,46 @@ def log_rollout_images(
             tb_writer.add_scalar(f"{tag}/r_vqa", row["r_vqa"], global_step)
             tb_writer.add_scalar(f"{tag}/advantage", row["advantage"], global_step)
 
+
+def log_rollout_sample_image_files(
+    tb_writer: SummaryWriter | None,
+    output_dir: Path,
+    global_step: int,
+    images: list[Image.Image],
+    prompt: str,
+    max_logged_images: int,
+    r_total: torch.Tensor,
+    r_ir: torch.Tensor,
+    r_vqa: torch.Tensor,
+    advantages: torch.Tensor,
+) -> None:
+    """Optional PNGs on disk and TensorBoard image panels (subset capped by max_logged_images)."""
+    if not images or max_logged_images <= 0:
+        return
+
+    g = len(images)
+    n = min(g, max_logged_images, int(r_total.shape[0]), int(advantages.shape[0]))
+    if n <= 0:
+        return
+
+    chosen = images[:n]
+    rt = r_total.detach().float().cpu()[:n]
+    ri = r_ir.detach().float().cpu()[:n]
+    rv = r_vqa.detach().float().cpu()[:n]
+    adv = advantages.detach().float().cpu()[:n]
+
+    prompt_tag = sanitize_filename(prompt)
+    rollout_dir = output_dir / "rollout_samples" / f"step_{global_step:08d}"
+    rollout_dir.mkdir(parents=True, exist_ok=True)
+
+    tensors: list[torch.Tensor] = []
+    for idx, image in enumerate(chosen):
+        save_path = rollout_dir / f"{idx:02d}_{prompt_tag}.png"
+        image.save(save_path)
+        if tb_writer is not None:
+            tensors.append(pil_to_tensor(image.convert("RGB")).float() / 255.0)
+
+    if tb_writer is not None:
         for idx, image in enumerate(chosen):
             ann = _annotate_rollout_image_pil(
                 image,
@@ -981,6 +1260,7 @@ def run_ddpo_update(
     device: torch.device,
     backward_fn,
     grad_trace: dict | None = None,
+    accelerator: Accelerator | None = None,
 ) -> tuple[int, torch.Tensor]:
     train_start = time.perf_counter()
     latents_b = batch["latents_b"]
@@ -1000,8 +1280,25 @@ def run_ddpo_update(
         else nullcontext()
     )
 
+    flat_n = int(G) * int(num_train_steps)
+    tb = max(1, int(args.train_batch_size))
+    micro_per_inner = math.ceil(flat_n / tb)
+    total_micro_batches = int(args.train_num_inner_epochs) * micro_per_inner
+    acc_steps = max(1, int(args.gradient_accumulation_steps))
+    ddpo_scale = _ddpo_subsample_loss_scale(args, num_train_steps)
+
     metrics = torch.zeros(3, device=device, dtype=torch.float32)
     num_updates = 0
+    micro_batch_count = 0
+    micro_idx = 0
+
+    if accelerator is None:
+        optimizer.zero_grad(set_to_none=True)
+    else:
+        # Accelerate 的 grad-acc 计数器默认跨整个训练递增；我们按「每个 GRPO 样本」跑完所有 micro-batch，
+        # 必须每样本重置，否则窗口跨样本且 remainder 步可能永不触发 sync → optimizer 被跳过、global_step 与 pbar 卡住。
+        accelerator.step = 0
+
     for _inner in range(args.train_num_inner_epochs):
         flat_lat = latents_b.reshape(-1, c, h, w)
         flat_next = next_latents_b.reshape(-1, c, h, w)
@@ -1011,50 +1308,93 @@ def run_ddpo_update(
 
         n = flat_lat.shape[0]
         for start in range(0, n, args.train_batch_size):
+            micro_idx += 1
+            micro_batch_count += 1
             end = min(start + args.train_batch_size, n)
-            loss, approx_kl, clipfrac = sdxl_ddpo_calculate_loss(
-                pipe,
-                flat_lat[start:end],
-                flat_time[start:end],
-                flat_next[start:end],
-                flat_logp[start:end],
-                flat_adv[start:end],
-                batch["prompt_embeds"],
-                batch["negative_prompt_embeds"],
-                batch["pooled_prompt_embeds"],
-                batch["negative_pooled_prompt_embeds"],
-                batch["add_time_ids"],
-                args.sample_guidance_scale,
-                args.train_cfg,
-                args.train_clip_range,
-                args.train_adv_clip_max,
-                args.sample_eta,
-                autocast_cm,
-            )
-            optimizer.zero_grad()
-            backward_fn(loss)
-            if grad_trace is not None and not grad_trace.get("logged_grad"):
-                gnorm, gcnt = _trainable_grad_l2_norm(pipe.unet)
-                grad_trace["logged_grad"] = True
-                if gcnt == 0:
-                    logger.warning(
-                        "首次 backward 后没有任何可训练参数的 grad（LoRA 可能未接入计算图，或 loss 与 UNet 已断开）。"
-                        "loss=%.6e 若长期如此请检查 sample_eta>0、advantage 是否全 0。",
-                        float(loss.detach().item()),
-                    )
+            accum_cm = accelerator.accumulate(pipe.unet) if accelerator is not None else nullcontext()
+            with accum_cm:
+                loss, approx_kl, clipfrac = sdxl_ddpo_calculate_loss(
+                    pipe,
+                    flat_lat[start:end],
+                    flat_time[start:end],
+                    flat_next[start:end],
+                    flat_logp[start:end],
+                    flat_adv[start:end],
+                    batch["prompt_embeds"],
+                    batch["negative_prompt_embeds"],
+                    batch["pooled_prompt_embeds"],
+                    batch["negative_pooled_prompt_embeds"],
+                    batch["add_time_ids"],
+                    args.sample_guidance_scale,
+                    args.train_cfg,
+                    args.train_clip_range,
+                    args.train_adv_clip_max,
+                    args.sample_eta,
+                    autocast_cm,
+                )
+                loss = loss * ddpo_scale
+                approx_kl = approx_kl * ddpo_scale
+                if accelerator is None:
+                    loss_scaled = loss / acc_steps
+                    should_sync_step = (micro_idx % acc_steps == 0) or (micro_idx == total_micro_batches)
+                    with _ddp_no_sync_if(pipe.unet, acc_steps > 1 and not should_sync_step):
+                        loss_scaled.backward()
+                    if grad_trace is not None and not grad_trace.get("logged_grad"):
+                        gnorm, gcnt = _trainable_grad_l2_norm(pipe.unet)
+                        grad_trace["logged_grad"] = True
+                        if gcnt == 0:
+                            logger.warning(
+                                "首次 backward 后没有任何可训练参数的 grad（LoRA 可能未接入计算图，或 loss 与 UNet 已断开）。"
+                                "loss=%.6e 若长期如此请检查 sample_eta>0、advantage 是否全 0。",
+                                float(loss.detach().item()),
+                            )
+                        else:
+                            logger.info(
+                                "首次 optimizer 步: 含 grad 的 trainable 参数数=%d, grad L2 范数=%.6e, loss=%.6e",
+                                gcnt,
+                                gnorm,
+                                float(loss.detach().item()),
+                            )
+                    if should_sync_step:
+                        optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
+                        num_updates += 1
                 else:
-                    logger.info(
-                        "首次 optimizer 步: 含 grad 的 trainable 参数数=%d, grad L2 范数=%.6e, loss=%.6e",
-                        gcnt,
-                        gnorm,
-                        float(loss.detach().item()),
-                    )
-            optimizer.step()
+                    backward_fn(loss)
+                    if grad_trace is not None and not grad_trace.get("logged_grad"):
+                        gnorm, gcnt = _trainable_grad_l2_norm(pipe.unet)
+                        grad_trace["logged_grad"] = True
+                        if gcnt == 0:
+                            logger.warning(
+                                "首次 backward 后没有任何可训练参数的 grad（LoRA 可能未接入计算图，或 loss 与 UNet 已断开）。"
+                                "loss=%.6e 若长期如此请检查 sample_eta>0、advantage 是否全 0。",
+                                float(loss.detach().item()),
+                            )
+                        else:
+                            logger.info(
+                                "首次 optimizer 步: 含 grad 的 trainable 参数数=%d, grad L2 范数=%.6e, loss=%.6e",
+                                gcnt,
+                                gnorm,
+                                float(loss.detach().item()),
+                            )
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+
+            if accelerator is not None and accelerator.sync_gradients:
+                num_updates += 1
+
             metrics += torch.stack([loss.detach(), approx_kl.detach(), clipfrac.detach()]).to(torch.float32)
+
+    if accelerator is not None and micro_idx > 0:
+        rem = micro_idx % acc_steps
+        if rem != 0:
+            accelerator.sync_gradients = True
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
             num_updates += 1
 
     train_metrics = make_train_metrics_tensor(
-        train_metrics=metrics / max(num_updates, 1),
+        train_metrics=metrics / max(micro_batch_count, 1),
         updates=num_updates,
         optimizer=optimizer,
         train_sec=time.perf_counter() - train_start,
@@ -1064,12 +1404,98 @@ def run_ddpo_update(
 
 def save_lora(path: Path, pipe, accelerator: Accelerator):
     path.mkdir(parents=True, exist_ok=True)
-    unet = get_unet_module(accelerator.unwrap_model(pipe.unet))
+    raw = pipe.unet
+    if isinstance(raw, DDP):
+        unet = get_unet_module(raw)
+    else:
+        unet = get_unet_module(accelerator.unwrap_model(raw))
     state_dict = get_peft_model_state_dict(unet)
     from safetensors.torch import save_file
 
     save_file(state_dict, path / "unet_lora.safetensors")
     logger.info("Saved LoRA to %s", path)
+
+
+def _parse_checkpoint_dir_step(name: str) -> int | None:
+    m = re.match(r"^checkpoint-(\d+)$", name)
+    return int(m.group(1)) if m else None
+
+
+def resolve_resume_checkpoint_dir(output_dir: Path, resume_arg: str | None) -> Path | None:
+    if not resume_arg:
+        return None
+    out = Path(output_dir)
+    if resume_arg.strip().lower() == "latest":
+        cdirs = []
+        for p in out.glob("checkpoint-*"):
+            if p.is_dir():
+                st = _parse_checkpoint_dir_step(p.name)
+                if st is not None:
+                    cdirs.append((st, p))
+        if not cdirs:
+            raise FileNotFoundError(f'No checkpoint-* under "{out}" for resume_from_checkpoint=latest')
+        return max(cdirs, key=lambda x: x[0])[1]
+    p = Path(resume_arg)
+    if not p.is_dir():
+        raise FileNotFoundError(f"resume_from_checkpoint is not a directory: {p}")
+    return p.resolve()
+
+
+def load_resume_state_from_dir(ckpt_dir: Path) -> ResumeState:
+    state_path = ckpt_dir / "training_state.pt"
+    if not state_path.is_file():
+        raise FileNotFoundError(f"Missing {state_path} (not a full training checkpoint)")
+    blob = torch.load(state_path, map_location="cpu", weights_only=False)
+    if int(blob.get("version", 0)) < 1:
+        raise ValueError(f"Unknown checkpoint version in {state_path}")
+    return ResumeState(
+        global_step=int(blob["global_step"]),
+        epoch=int(blob["epoch"]),
+        sample_idx_in_epoch=int(blob["sample_idx_in_epoch"]),
+        optimizer_state=blob["optimizer"],
+    )
+
+
+def prune_old_checkpoints(output_dir: Path, limit: int | None) -> None:
+    if limit is None or limit < 1:
+        return
+    cdirs = []
+    for p in Path(output_dir).glob("checkpoint-*"):
+        if p.is_dir():
+            st = _parse_checkpoint_dir_step(p.name)
+            if st is not None:
+                cdirs.append((st, p))
+    cdirs.sort(key=lambda x: x[0])
+    while len(cdirs) > limit:
+        _, old = cdirs.pop(0)
+        shutil.rmtree(old, ignore_errors=True)
+        logger.info("Removed old checkpoint %s (checkpoints_total_limit=%d)", old, limit)
+
+
+def save_training_checkpoint(
+    ckpt_dir: Path,
+    pipe,
+    optimizer,
+    accelerator: Accelerator,
+    *,
+    global_step: int,
+    epoch: int,
+    next_sample_idx_in_epoch: int,
+) -> None:
+    """unet_lora.safetensors + training_state.pt (optimizer + resume cursor)."""
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    save_lora(ckpt_dir, pipe, accelerator)
+    torch.save(
+        {
+            "version": 1,
+            "global_step": int(global_step),
+            "epoch": int(epoch),
+            "sample_idx_in_epoch": int(next_sample_idx_in_epoch),
+            "optimizer": optimizer.state_dict(),
+        },
+        ckpt_dir / "training_state.pt",
+    )
+    logger.info("Saved training checkpoint %s (global_step=%d)", ckpt_dir, global_step)
 
 
 def run_standard_training(
@@ -1082,6 +1508,7 @@ def run_standard_training(
     vqa_scorer,
     num_train_steps: int,
     torch_dtype: torch.dtype,
+    resume: ResumeState | None = None,
 ):
     device = accelerator.device
     out_dir = Path(args.output_dir)
@@ -1091,11 +1518,21 @@ def run_standard_training(
     trainable = trainable_params(pipe.unet)
     optimizer = torch.optim.AdamW(trainable, lr=args.train_learning_rate)
     pipe.unet, optimizer = accelerator.prepare(pipe.unet, optimizer)
+    if resume is not None:
+        optimizer.load_state_dict(resume.optimizer_state)
+        logger.info(
+            "Resumed optimizer state (global_step=%d epoch=%d sample_idx=%d)",
+            resume.global_step,
+            resume.epoch,
+            resume.sample_idx_in_epoch,
+        )
 
     steps_per_sample = optimizer_steps_per_sample(args, num_train_steps)
     grad_trace: dict = {}
-    global_step = 0
-    for epoch in range(args.num_epochs):
+    global_step = resume.global_step if resume else 0
+    start_epoch = resume.epoch if resume else 0
+    start_sample_idx = resume.sample_idx_in_epoch if resume else 0
+    for epoch in range(start_epoch, args.num_epochs):
         epoch_samples, _dropped = epoch_samples_for_rank(
             samples,
             epoch=epoch,
@@ -1104,15 +1541,18 @@ def run_standard_training(
             shard_idx=0,
             drop_last=False,
         )
-        epoch_opt_total = len(epoch_samples) * steps_per_sample
+        skip_head = start_sample_idx if epoch == start_epoch else 0
+        epoch_tail = epoch_samples[skip_head:]
+        epoch_opt_total = len(epoch_tail) * steps_per_sample
         pbar = tqdm(
             total=epoch_opt_total,
             unit="opt_step",
             disable=not accelerator.is_local_main_process,
             desc=f"epoch {epoch}",
         )
-        samples_seen = 0
-        for sample in epoch_samples:
+        samples_seen = skip_head
+        for rel_i, sample in enumerate(epoch_tail):
+            abs_sample_idx = skip_head + rel_i
             batch = build_rollout_training_batch(
                 pipe=pipe,
                 sample=sample,
@@ -1139,35 +1579,88 @@ def run_standard_training(
                 device=device,
                 backward_fn=accelerator.backward,
                 grad_trace=grad_trace,
+                accelerator=accelerator,
             )
             global_step += updates
             samples_seen += 1
             pbar.update(updates)
-            pbar.set_postfix(gstep=global_step, samples=samples_seen, refresh=True)
-
-            maybe_log_step_scalars(
-                tb_writer=tb_writer,
-                global_step=global_step,
-                logging_steps=args.logging_steps,
-                rollout_metrics=reward_metrics,
-                train_metrics=train_metrics,
+            loss_v = float(train_metrics[0].detach().item())
+            rmean_v = float(reward_metrics[0].detach().item())
+            pbar.set_postfix(
+                gstep=global_step,
+                samples=samples_seen,
+                loss=f"{loss_v:.4f}",
+                rwd=f"{rmean_v:.4f}",
+                refresh=True,
             )
-            if should_log_images(global_step, args.log_image_steps):
-                log_rollout_images(
-                    tb_writer=tb_writer,
-                    output_dir=out_dir,
-                    global_step=global_step,
-                    images=images_pil,
-                    prompt=prompt_text,
-                    max_logged_images=args.max_logged_images,
-                    r_total=roll_r_total,
-                    r_ir=roll_r_ir,
-                    r_vqa=roll_r_vqa,
-                    advantages=batch["advantages"],
-                )
 
-            if accelerator.is_main_process and global_step > 0 and global_step % args.save_steps == 0:
+            if updates > 0:
+                maybe_log_step_scalars(
+                    tb_writer=tb_writer,
+                    global_step=global_step,
+                    logging_steps=args.logging_steps,
+                    rollout_metrics=reward_metrics,
+                    train_metrics=train_metrics,
+                )
+            if updates > 0 and should_log_images(global_step, args.log_image_steps):
+                if accelerator.is_main_process:
+                    log_rollout_group_reward_advantage(
+                        tb_writer=tb_writer,
+                        output_dir=out_dir,
+                        global_step=global_step,
+                        prompt=prompt_text,
+                        r_total=roll_r_total,
+                        r_ir=roll_r_ir,
+                        r_vqa=roll_r_vqa,
+                        advantages=batch["advantages"],
+                        write_disk=True,
+                    )
+                if accelerator.is_main_process and args.save_rollout_sample_images:
+                    log_rollout_sample_image_files(
+                        tb_writer=tb_writer,
+                        output_dir=out_dir,
+                        global_step=global_step,
+                        images=images_pil,
+                        prompt=prompt_text,
+                        max_logged_images=args.max_logged_images,
+                        r_total=roll_r_total,
+                        r_ir=roll_r_ir,
+                        r_vqa=roll_r_vqa,
+                        advantages=batch["advantages"],
+                    )
+
+            if (
+                updates > 0
+                and accelerator.is_main_process
+                and global_step > 0
+                and global_step % args.save_steps == 0
+            ):
                 save_lora(Path(args.output_dir) / f"lora_step_{global_step}", pipe, accelerator)
+
+            ck_every = int(args.checkpointing_steps)
+            if (
+                ck_every > 0
+                and updates > 0
+                and accelerator.is_main_process
+                and global_step > 0
+                and global_step % ck_every == 0
+            ):
+                prune_old_checkpoints(Path(args.output_dir), args.checkpoints_total_limit)
+                ckpt_path = Path(args.output_dir) / f"checkpoint-{global_step}"
+                ne, ns = (
+                    (epoch + 1, 0)
+                    if abs_sample_idx + 1 >= len(epoch_samples)
+                    else (epoch, abs_sample_idx + 1)
+                )
+                save_training_checkpoint(
+                    ckpt_path,
+                    pipe,
+                    optimizer,
+                    accelerator,
+                    global_step=global_step,
+                    epoch=ne,
+                    next_sample_idx_in_epoch=ns,
+                )
         pbar.close()
 
 
@@ -1182,6 +1675,7 @@ def run_split_training(
     num_train_steps: int,
     torch_dtype: torch.dtype,
     split_cfg: SplitRoleConfig,
+    resume: ResumeState | None = None,
 ):
     device = accelerator.device
     out_dir = Path(args.output_dir)
@@ -1197,10 +1691,21 @@ def run_split_training(
             broadcast_buffers=False,
         )
         optimizer = torch.optim.AdamW(trainable_params(pipe.unet), lr=args.train_learning_rate)
+        if resume is not None:
+            optimizer.load_state_dict(resume.optimizer_state)
+            if split_cfg.is_train_main:
+                logger.info(
+                    "Resumed split optimizer (global_step=%d epoch=%d sample_idx=%d)",
+                    resume.global_step,
+                    resume.epoch,
+                    resume.sample_idx_in_epoch,
+                )
 
     grad_trace: dict = {}
-    global_step = 0
-    for epoch in range(args.num_epochs):
+    global_step = resume.global_step if resume else 0
+    start_epoch = resume.epoch if resume else 0
+    start_sample_idx = resume.sample_idx_in_epoch if resume else 0
+    for epoch in range(start_epoch, args.num_epochs):
         pair_samples, dropped = epoch_samples_for_rank(
             samples,
             epoch=epoch,
@@ -1214,9 +1719,11 @@ def run_split_training(
         if not pair_samples:
             raise RuntimeError("No samples left for split infer/train mode; increase dataset size or lower process count")
 
+        skip_head = start_sample_idx if epoch == start_epoch else 0
+        pair_tail = pair_samples[skip_head:]
+        epoch_opt_total = len(pair_tail) * updates_per_sample
         show_infer_pbar = split_cfg.is_infer_rank and accelerator.is_local_main_process and split_cfg.pair_idx == 0
         show_train_pbar = split_cfg.is_train_rank and split_cfg.is_train_main
-        epoch_opt_total = len(pair_samples) * updates_per_sample
         infer_pbar = tqdm(
             total=epoch_opt_total,
             unit="opt_step",
@@ -1231,7 +1738,7 @@ def run_split_training(
         )
 
         if split_cfg.is_infer_rank:
-            for sample in pair_samples:
+            for sample in pair_tail:
                 payload = build_rollout_training_batch(
                     pipe=pipe,
                     sample=sample,
@@ -1243,18 +1750,31 @@ def run_split_training(
                     vqa_scorer=vqa_scorer,
                 )
                 if should_log_images(global_step + updates_per_sample, args.log_image_steps):
-                    log_rollout_images(
+                    _log_step = global_step + updates_per_sample
+                    log_rollout_group_reward_advantage(
                         tb_writer=None,
                         output_dir=out_dir,
-                        global_step=global_step + updates_per_sample,
-                        images=payload["images_pil"],
+                        global_step=_log_step,
                         prompt=payload["prompt_text"],
-                        max_logged_images=args.max_logged_images,
                         r_total=payload["rollout_r_total"],
                         r_ir=payload["rollout_r_ir"],
                         r_vqa=payload["rollout_r_vqa"],
                         advantages=payload["advantages"],
+                        write_disk=True,
                     )
+                    if args.save_rollout_sample_images:
+                        log_rollout_sample_image_files(
+                            tb_writer=None,
+                            output_dir=out_dir,
+                            global_step=_log_step,
+                            images=payload["images_pil"],
+                            prompt=payload["prompt_text"],
+                            max_logged_images=args.max_logged_images,
+                            r_total=payload["rollout_r_total"],
+                            r_ir=payload["rollout_r_ir"],
+                            r_vqa=payload["rollout_r_vqa"],
+                            advantages=payload["advantages"],
+                        )
                 payload.pop("images_pil")
                 payload.pop("prompt_text")
                 send_rollout_payload(payload, split_cfg.pair_rank)
@@ -1266,7 +1786,7 @@ def run_split_training(
             train_pbar.close()
             continue
 
-        for _step in range(len(pair_samples)):
+        for _step in range(skip_head, len(pair_samples)):
             payload = recv_rollout_payload(split_cfg.pair_rank, device)
             roll_r_total = payload.pop("rollout_r_total")
             roll_r_ir = payload.pop("rollout_r_ir")
@@ -1284,7 +1804,6 @@ def run_split_training(
             )
             global_step += updates
             train_pbar.update(updates)
-            train_pbar.set_postfix(gstep=global_step, refresh=True)
 
             reward_metrics = reward_metrics.to(device=device, dtype=torch.float32)
             train_metrics = train_metrics.to(device=device, dtype=torch.float32)
@@ -1293,42 +1812,95 @@ def run_split_training(
             reward_metrics /= split_cfg.num_train_processes
             train_metrics /= split_cfg.num_train_processes
 
-            maybe_log_step_scalars(
-                tb_writer=tb_writer,
-                global_step=global_step,
-                logging_steps=args.logging_steps,
-                rollout_metrics=reward_metrics,
-                train_metrics=train_metrics,
+            loss_v = float(train_metrics[0].item())
+            rmean_v = float(reward_metrics[0].item())
+            train_pbar.set_postfix(
+                gstep=global_step,
+                loss=f"{loss_v:.4f}",
+                rwd=f"{rmean_v:.4f}",
+                refresh=True,
             )
-            if should_log_images(global_step, args.log_image_steps):
-                pair_step_dir = out_dir / "rollout_samples" / f"step_{global_step:08d}"
-                tb_images_pil: list[Image.Image] = []
-                if pair_step_dir.exists():
-                    for image_path in sorted(pair_step_dir.glob("*.png"))[: args.max_logged_images]:
-                        with Image.open(image_path) as im:
-                            tb_images_pil.append(im.convert("RGB"))
-                prompt_tb = ""
-                ppt = pair_step_dir / "prompt.txt"
-                if ppt.is_file():
-                    prompt_tb = ppt.read_text(encoding="utf-8")
-                if tb_images_pil:
-                    log_rollout_images(
+
+            if updates > 0:
+                maybe_log_step_scalars(
+                    tb_writer=tb_writer,
+                    global_step=global_step,
+                    logging_steps=args.logging_steps,
+                    rollout_metrics=reward_metrics,
+                    train_metrics=train_metrics,
+                )
+            if updates > 0 and should_log_images(global_step, args.log_image_steps):
+                if split_cfg.is_train_main:
+                    log_rollout_group_reward_advantage(
                         tb_writer=tb_writer,
                         output_dir=out_dir,
                         global_step=global_step,
-                        images=tb_images_pil,
-                        prompt=prompt_tb or "(missing prompt.txt)",
-                        max_logged_images=args.max_logged_images,
+                        prompt=None,
                         r_total=roll_r_total,
                         r_ir=roll_r_ir,
                         r_vqa=roll_r_vqa,
                         advantages=payload["advantages"],
+                        write_disk=False,
                     )
+                if split_cfg.is_train_main and args.save_rollout_sample_images:
+                    pair_step_dir = out_dir / "rollout_samples" / f"step_{global_step:08d}"
+                    tb_images_pil: list[Image.Image] = []
+                    if pair_step_dir.exists():
+                        for image_path in sorted(pair_step_dir.glob("*.png"))[: args.max_logged_images]:
+                            with Image.open(image_path) as im:
+                                tb_images_pil.append(im.convert("RGB"))
+                    prompt_tb = ""
+                    ppt = pair_step_dir / "prompt.txt"
+                    if ppt.is_file():
+                        prompt_tb = ppt.read_text(encoding="utf-8")
+                    if tb_images_pil:
+                        log_rollout_sample_image_files(
+                            tb_writer=tb_writer,
+                            output_dir=out_dir,
+                            global_step=global_step,
+                            images=tb_images_pil,
+                            prompt=prompt_tb or "(missing prompt.txt)",
+                            max_logged_images=args.max_logged_images,
+                            r_total=roll_r_total,
+                            r_ir=roll_r_ir,
+                            r_vqa=roll_r_vqa,
+                            advantages=payload["advantages"],
+                        )
 
             sync_trainable_params(pipe.unet, split_cfg.pair_rank, send=True)
 
-            if split_cfg.is_train_main and global_step > 0 and global_step % args.save_steps == 0:
+            if (
+                updates > 0
+                and split_cfg.is_train_main
+                and global_step > 0
+                and global_step % args.save_steps == 0
+            ):
                 save_lora(out_dir / f"lora_step_{global_step}", pipe, accelerator)
+
+            ck_every = int(args.checkpointing_steps)
+            if (
+                ck_every > 0
+                and updates > 0
+                and split_cfg.is_train_main
+                and global_step > 0
+                and global_step % ck_every == 0
+            ):
+                prune_old_checkpoints(out_dir, args.checkpoints_total_limit)
+                ckpt_path = out_dir / f"checkpoint-{global_step}"
+                ne, ns = (
+                    (epoch + 1, 0)
+                    if _step + 1 >= len(pair_samples)
+                    else (epoch, _step + 1)
+                )
+                save_training_checkpoint(
+                    ckpt_path,
+                    pipe,
+                    optimizer,
+                    accelerator,
+                    global_step=global_step,
+                    epoch=ne,
+                    next_sample_idx_in_epoch=ns,
+                )
         train_pbar.close()
         infer_pbar.close()
 
@@ -1342,6 +1914,7 @@ def main():
     _apply_split_infer_gpu_visibility(args)
     accelerator = Accelerator(
         mixed_precision=args.mixed_precision,
+        gradient_accumulation_steps=max(1, int(args.gradient_accumulation_steps)),
         project_config=ProjectConfiguration(project_dir=args.output_dir),
     )
     device = accelerator.device
@@ -1358,12 +1931,23 @@ def main():
 
     split_cfg = setup_split_roles(args, accelerator)
 
+    resume_ckpt_dir: Path | None = None
+    resume_state: ResumeState | None = None
+    if args.resume_from_checkpoint:
+        resume_ckpt_dir = resolve_resume_checkpoint_dir(out_dir, args.resume_from_checkpoint)
+        resume_state = load_resume_state_from_dir(resume_ckpt_dir)
+        lora_file = resume_ckpt_dir / "unet_lora.safetensors"
+        if not lora_file.is_file():
+            raise FileNotFoundError(f"Resume directory missing LoRA weights: {lora_file}")
+
     tb_dir = out_dir / "logs_grpo"
     should_write_tb = split_cfg.is_train_main if split_cfg.enabled else accelerator.is_main_process
     tb_writer = SummaryWriter(log_dir=str(tb_dir)) if should_write_tb else None
     log_run_config(tb_writer, args, accelerator, split_cfg)
 
-    pipe = load_pipeline(args, str(device), torch_dtype)
+    lora_ckpt = str(resume_ckpt_dir / "unet_lora.safetensors") if resume_ckpt_dir else None
+    pipe = load_pipeline(args, str(device), torch_dtype, lora_path_override=lora_ckpt)
+    accelerator.wait_for_everyone()
     pipe.vae.requires_grad_(False)
     pipe.text_encoder.requires_grad_(False)
     if pipe.text_encoder_2 is not None:
@@ -1429,6 +2013,8 @@ def main():
         num_samples=len(samples),
         torch_dtype=torch_dtype,
         device=device,
+        resume_state=resume_state,
+        resume_ckpt_dir=str(resume_ckpt_dir) if resume_ckpt_dir else None,
     )
     if split_cfg.enabled:
         run_split_training(
@@ -1442,6 +2028,7 @@ def main():
             num_train_steps=num_train_steps,
             torch_dtype=torch_dtype,
             split_cfg=split_cfg,
+            resume=resume_state,
         )
     else:
         run_standard_training(
@@ -1454,6 +2041,7 @@ def main():
             vqa_scorer=vqa_scorer,
             num_train_steps=num_train_steps,
             torch_dtype=torch_dtype,
+            resume=resume_state,
         )
         if accelerator.is_main_process:
             save_lora(out_dir / "lora_final", pipe, accelerator)
