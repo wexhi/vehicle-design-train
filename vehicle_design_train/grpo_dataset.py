@@ -14,6 +14,8 @@ class GrpoJsonlSample:
     prompt_en: str
     judge_questions: list[dict[str, Any]]
     meta: dict[str, Any]
+    # GenEval (yifan123/reward-server): same structure as flow_grpo dataset/geneval/*_metadata.jsonl lines
+    geneval: dict[str, Any] | None = None
 
 
 def iter_grpo_jsonl(
@@ -42,7 +44,24 @@ def iter_grpo_jsonl(
             if not isinstance(judges, list):
                 judges = []
             meta = {k: obj.get(k) for k in ("sample_id", "uuid", "task_group", "dataset_version")}
-            yield GrpoJsonlSample(prompt_en=prompt, judge_questions=judges, meta={k: v for k, v in meta.items() if v})
+            ge = obj.get("geneval") or obj.get("geneval_metadata")
+            geneval_dict: dict[str, Any] | None = None
+            if isinstance(ge, dict):
+                geneval_dict = dict(ge)
+                geneval_dict.setdefault("prompt", prompt)
+                if "tag" not in geneval_dict or "include" not in geneval_dict:
+                    logger.warning(
+                        "Skip line %d: geneval/geneval_metadata dict missing required keys tag/include",
+                        line_no,
+                    )
+                    geneval_dict = None
+            meta_clean = {k: v for k, v in meta.items() if v}
+            yield GrpoJsonlSample(
+                prompt_en=prompt,
+                judge_questions=judges,
+                meta=meta_clean,
+                geneval=geneval_dict,
+            )
             n += 1
             if max_samples is not None and n >= max_samples:
                 break

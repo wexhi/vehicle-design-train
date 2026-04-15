@@ -140,7 +140,10 @@ class VqaRolloutGroupMixin:
         images: list[Image.Image],
         prompt_en: str,
         judge_questions: Optional[list[dict[str, Any]]],
+        *,
+        geneval_metadata: Optional[dict[str, Any]] = None,
     ) -> tuple[list[float], list[dict[str, Any]]]:
+        del geneval_metadata  # GenEval / PickScore pass this; LLM VQA backends ignore
         judges = list(judge_questions or [])
         global_q = self.global_question_template_en.format(prompt=prompt_en)
         n_img = len(images)
@@ -221,6 +224,10 @@ class VqaRolloutGroupMixin:
         image: Image.Image,
         prompt_en: str,
         judge_questions: Optional[list[dict[str, Any]]],
+        *,
+        geneval_metadata: Optional[dict[str, Any]] = None,
     ) -> tuple[float, dict[str, Any]]:
-        scores, details_list = self.score_rollout_group([image], prompt_en, judge_questions)
+        scores, details_list = self.score_rollout_group(
+            [image], prompt_en, judge_questions, geneval_metadata=geneval_metadata
+        )
         return scores[0], details_list[0]

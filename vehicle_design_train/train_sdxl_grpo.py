@@ -37,11 +37,16 @@ from vehicle_design_train.grpo.sdxl_rollout import ensure_ddim_scheduler, sdxl_d
 from vehicle_design_train.grpo_dataset import list_grpo_jsonl
 from vehicle_design_train.rewards.composite import combine_rewards
 from vehicle_design_train.rewards.imagereward_scorer import ImageRewardScorer
+from vehicle_design_train.rewards.geneval_remote_scorer import GenevalRemoteScorer
+from vehicle_design_train.rewards.pickscore_scorer import FlowGrpoPickScoreReward
 from vehicle_design_train.rewards.vqa_prob_scorer import (
     DEFAULT_GLOBAL_TEMPLATE_EN,
     DashScopeVqaProbScorer,
 )
-from vehicle_design_train.rewards.vqa_vllm_scorer import VllmOpenAiVqaProbScorer
+from vehicle_design_train.rewards.vqa_vllm_scorer import (
+    VllmOpenAiStructuredVqaScorer,
+    VllmOpenAiVqaProbScorer,
+)
 
 logger = get_logger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -197,7 +202,12 @@ class SplitRoleConfig:
 def parse_args():
     p = argparse.ArgumentParser(description="SDXL GRPO-style RL fine-tuning (DDPO + group advantages)")
     p.add_argument("--pretrained_model_name_or_path", type=str, required=True)
-    p.add_argument("--grpo_jsonl", type=str, required=True, help="v3 JSONL with prompt_en and judge_questions")
+    p.add_argument(
+        "--grpo_jsonl",
+        type=str,
+        required=True,
+        help="v3 JSONL: prompt_en, judge_requirements; optional geneval=... for --vqa_backend=geneval_remote",
+    )
     p.add_argument("--prompt_field", type=str, default="prompt_en")
     p.add_argument("--output_dir", type=str, required=True)
     p.add_argument("--lora_path", type=str, default=None, help="Optional existing LoRA weights directory or .safetensors")
@@ -252,15 +262,21 @@ def parse_args():
     )
     p.add_argument("--train_num_inner_epochs", type=int, default=1)
     p.add_argument("--weight_ir", type=float, default=0.5)
-    p.add_argument("--weight_vqa", type=float, default=0.5)
+    p.add_argument(
+        "--weight_vqa",
+        type=float,
+        default=0.5,
+        help="Weight for second reward: LLM VQA log-probs, or PickScore if --vqa_backend=pickscore (Flow-GRPO). "
+        "Use 0 to skip loading/calling any VQA backend (no DashScope, vLLM, PickScore, or GenEval).",
+    )
     p.add_argument("--vqa_global_weight", type=float, default=1.0)
     p.add_argument("--vqa_judge_weight", type=float, default=1.0)
     p.add_argument(
         "--vqa_backend",
         type=str,
         default="dashscope",
-        choices=["dashscope", "vllm_openai"],
-        help="VQA backend: 百炼 DashScope or OpenAI-compatible (e.g. vLLM serving Qwen3.5).",
+        choices=["dashscope", "vllm_openai", "vllm_openai_structured", "pickscore", "geneval_remote"],
+        help="vllm_openai=logprob; vllm_openai_structured=<Thought>+<Answer>yes|no</Answer>; pickscore; geneval.",
     )
     p.add_argument(
         "--vqa_model",
@@ -283,14 +299,45 @@ def parse_args():
     p.add_argument(
         "--vqa_enable_thinking",
         action="store_true",
-        help="Qwen3.5 on vLLM: enable thinking in chat_template (default off for Yes/No + logprobs).",
+        help="vllm_openai (logprob): enable thinking (default off).",
     )
+    p.add_argument("--vqa_structured_max_tokens", type=int, default=4096)
+    p.add_argument("--vqa_structured_temperature", type=float, default=0.0)
+    p.add_argument(
+        "--vqa_structured_disable_thinking",
+        action="store_true",
+        help="vllm_openai_structured: disable enable_thinking on vLLM.",
+    )
+    p.add_argument("--vqa_structured_timeout_sec", type=float, default=300.0)
     p.add_argument(
         "--vqa_max_workers",
         type=int,
         default=8,
-        help="Concurrent VQA HTTP calls per rollout group (DashScope or OpenAI client).",
+        help="Concurrent VQA HTTP calls per rollout group (ignored for pickscore).",
     )
+    p.add_argument(
+        "--pickscore_processor_id",
+        type=str,
+        default="laion/CLIP-ViT-H-14-laion2B-s32B-b79K",
+    )
+    p.add_argument("--pickscore_model_id", type=str, default="yuvalkirstain/PickScore_v1")
+    p.add_argument(
+        "--pickscore_max_batch_size",
+        type=int,
+        default=None,
+        help="PickScore GPU micro-batch; None = whole group at once.",
+    )
+    p.add_argument("--geneval_server_url", type=str, default="http://127.0.0.1:18085")
+    p.add_argument("--geneval_only_strict", action="store_true")
+    p.add_argument(
+        "--geneval_reward_field",
+        type=str,
+        default="score",
+        choices=["score", "accuracy", "strict_accuracy"],
+    )
+    p.add_argument("--geneval_timeout_sec", type=float, default=120.0)
+    p.add_argument("--geneval_max_batch_size", type=int, default=64)
+    p.add_argument("--geneval_max_retries", type=int, default=3)
     p.add_argument("--global_question_template_en", type=str, default=None)
     p.add_argument("--skip_vqa", action="store_true")
     p.add_argument("--skip_imagereward", action="store_true")
@@ -323,14 +370,21 @@ def parse_args():
         "--log_image_steps",
         type=int,
         default=0,
-        help="If > 0, every N optimizer steps log per-rollout r_total/r_ir/r_vqa/advantage (JSON under rollout_samples/ + TB text/scalars).",
+        help="If > 0, every N global optimizer steps log per-image r_total/r_ir/r_vqa/advantage: "
+        "JSON under output_dir/rollout_samples/step_XXXXXXXX/ and TensorBoard (rollout/sample_table + rollout_log/img_XX/*). "
+        "TB root: output_dir/logs_grpo. For TB image grids, add --save_rollout_sample_images.",
     )
     p.add_argument(
         "--save_rollout_sample_images",
         action="store_true",
-        help="With --log_image_steps>0, also save PNGs and TensorBoard image panels (capped by --max_logged_images). Default: metrics only, no images.",
+        help="Requires --log_image_steps>0. Saves PNGs under rollout_samples/ and TB rollout/images + rollout/img_XX_with_metrics (cap: --max_logged_images).",
     )
-    p.add_argument("--max_logged_images", type=int, default=4, help="Max rollout images to save/log to TB when --save_rollout_sample_images is set")
+    p.add_argument(
+        "--max_logged_images",
+        type=int,
+        default=4,
+        help="Max images per logged step on disk and in TensorBoard when --save_rollout_sample_images is set (typically ≤ group_size).",
+    )
     p.add_argument(
         "--checkpointing_steps",
         type=int,
@@ -575,6 +629,9 @@ def log_run_config(tb_writer: SummaryWriter | None, args, accelerator: Accelerat
         "config/weight_ir": float(args.weight_ir),
         "config/weight_vqa": float(args.weight_vqa),
         "config/vqa_max_workers": float(args.vqa_max_workers),
+        "config/pickscore_backend": 1.0 if args.vqa_backend == "pickscore" else 0.0,
+        "config/geneval_remote_backend": 1.0 if args.vqa_backend == "geneval_remote" else 0.0,
+        "config/vllm_structured_backend": 1.0 if args.vqa_backend == "vllm_openai_structured" else 0.0,
         "system/world_size": float(accelerator.num_processes),
         "system/split_infer_train": 1.0 if split_cfg.enabled else 0.0,
         "system/num_inference_processes": float(split_cfg.num_inference_processes if split_cfg.enabled else 0),
@@ -584,6 +641,12 @@ def log_run_config(tb_writer: SummaryWriter | None, args, accelerator: Accelerat
         tb_writer.add_scalar(name, value, 0)
     tb_writer.add_text("config/vqa_backend", args.vqa_backend, 0)
     tb_writer.add_text("config/vqa_model", args.vqa_model, 0)
+    if args.vqa_backend == "pickscore":
+        tb_writer.add_text("config/pickscore_processor_id", args.pickscore_processor_id, 0)
+        tb_writer.add_text("config/pickscore_model_id", args.pickscore_model_id, 0)
+    if args.vqa_backend == "geneval_remote":
+        tb_writer.add_text("config/geneval_server_url", args.geneval_server_url, 0)
+        tb_writer.add_text("config/geneval_reward_field", args.geneval_reward_field, 0)
     tb_writer.add_text(
         "config/train_gpu_ids",
         (args.train_gpu_ids or os.environ.get("GRPO_TRAIN_GPU_IDS") or "").strip(),
@@ -736,7 +799,18 @@ def print_training_startup_config(
         f"  weight_ir / weight_vqa:  {args.weight_ir} / {args.weight_vqa}",
         f"  skip_imagereward:        {args.skip_imagereward}",
         f"  skip_vqa:                {args.skip_vqa}",
-        f"  vqa_backend:             {args.vqa_backend}  model={args.vqa_model}",
+        f"  vqa_backend:             {args.vqa_backend}  model={args.vqa_model}"
+        + (
+            f"  pickscore={args.pickscore_processor_id} + {args.pickscore_model_id}"
+            if args.vqa_backend == "pickscore"
+            else f"  geneval={args.geneval_server_url} field={args.geneval_reward_field}"
+            if args.vqa_backend == "geneval_remote"
+            else (
+                f"  structured_VQA max_tok={args.vqa_structured_max_tokens} thinking={not args.vqa_structured_disable_thinking}"
+                if args.vqa_backend == "vllm_openai_structured"
+                else ""
+            )
+        ),
         "-" * 72,
         f"  save_steps:              {args.save_steps}",
         f"  checkpointing_steps:     {args.checkpointing_steps}  (0=关闭; 每 N 个全局 optimizer step 存 checkpoint-{{step}}/)",
@@ -1008,7 +1082,9 @@ def build_rollout_training_batch(
     if vqa_scorer is None:
         r_vqa_t = torch.zeros(args.group_size, device=device, dtype=torch.float32)
     else:
-        vqa_vals, _vqa_details = vqa_scorer.score_rollout_group(imgs, prompt, judges)
+        vqa_vals, _vqa_details = vqa_scorer.score_rollout_group(
+            imgs, prompt, judges, geneval_metadata=sample.geneval
+        )
         r_vqa_t = torch.tensor(vqa_vals, device=device, dtype=torch.float32)
 
     r_total = combine_rewards(
@@ -1971,9 +2047,26 @@ def main():
         )
     )
     vqa_scorer = None
-    if not args.skip_vqa and need_rewards:
-        tmpl = args.global_question_template_en or DEFAULT_GLOBAL_TEMPLATE_EN
-        if args.vqa_backend == "vllm_openai":
+    if not args.skip_vqa and need_rewards and args.weight_vqa != 0.0:
+        if args.vqa_backend == "pickscore":
+            vqa_scorer = FlowGrpoPickScoreReward(
+                device=device,
+                dtype=torch.float32,
+                processor_id=args.pickscore_processor_id,
+                model_id=args.pickscore_model_id,
+                max_batch_size=args.pickscore_max_batch_size,
+            )
+        elif args.vqa_backend == "geneval_remote":
+            vqa_scorer = GenevalRemoteScorer(
+                base_url=args.geneval_server_url,
+                only_strict=bool(args.geneval_only_strict),
+                reward_field=args.geneval_reward_field,
+                timeout_sec=args.geneval_timeout_sec,
+                max_batch_size=args.geneval_max_batch_size,
+                max_retries=args.geneval_max_retries,
+            )
+        elif args.vqa_backend == "vllm_openai":
+            tmpl = args.global_question_template_en or DEFAULT_GLOBAL_TEMPLATE_EN
             base_url = args.vqa_openai_base_url or os.environ.get("OPENAI_BASE_URL") or "http://127.0.0.1:8000/v1"
             oa_key = (
                 args.vqa_openai_api_key
@@ -1990,7 +2083,29 @@ def main():
                 max_workers=args.vqa_max_workers,
                 enable_thinking=args.vqa_enable_thinking,
             )
+        elif args.vqa_backend == "vllm_openai_structured":
+            tmpl = args.global_question_template_en or DEFAULT_GLOBAL_TEMPLATE_EN
+            base_url = args.vqa_openai_base_url or os.environ.get("OPENAI_BASE_URL") or "http://127.0.0.1:8000/v1"
+            oa_key = (
+                args.vqa_openai_api_key
+                if args.vqa_openai_api_key is not None
+                else os.environ.get("OPENAI_API_KEY", "EMPTY")
+            )
+            vqa_scorer = VllmOpenAiStructuredVqaScorer(
+                model=args.vqa_model,
+                base_url=base_url,
+                api_key=oa_key,
+                global_question_template_en=tmpl,
+                global_weight=args.vqa_global_weight,
+                judge_weight=args.vqa_judge_weight,
+                max_workers=args.vqa_max_workers,
+                max_tokens=args.vqa_structured_max_tokens,
+                temperature=args.vqa_structured_temperature,
+                enable_thinking=not args.vqa_structured_disable_thinking,
+                timeout_sec=args.vqa_structured_timeout_sec,
+            )
         else:
+            tmpl = args.global_question_template_en or DEFAULT_GLOBAL_TEMPLATE_EN
             api_key = os.environ.get("DASHSCOPE_API_KEY")
             vqa_scorer = DashScopeVqaProbScorer(
                 model=args.vqa_model,

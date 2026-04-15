@@ -12,6 +12,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _patch_transformers_for_imagereward() -> None:
+    """ImageReward vendors old BLIP code that imports helpers from transformers.modeling_utils; those live in
+    transformers.pytorch_utils since ~4.40."""
+    import transformers.modeling_utils as modeling_utils
+    import transformers.pytorch_utils as pytorch_utils
+
+    for name in (
+        "apply_chunking_to_forward",
+        "find_pruneable_heads_and_indices",
+        "prune_linear_layer",
+    ):
+        if not hasattr(modeling_utils, name):
+            setattr(modeling_utils, name, getattr(pytorch_utils, name))
+
+
 class ImageRewardScorer:
     """THUDM ImageReward (NeurIPS 2023) — human-preference RM scalar per (image, prompt)."""
 
@@ -29,6 +44,7 @@ class ImageRewardScorer:
     def _ensure_model(self):
         if self._model is not None:
             return
+        _patch_transformers_for_imagereward()
         import ImageReward as ir_mod
 
         self._model = ir_mod.load("ImageReward-v1.0", device=self.device)

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 在「单独目录 + 单独 venv」里启动 vLLM，供 GRPO 训练侧 --vqa_backend vllm_openai 调用。
+# 在「单独目录 + 单独 venv」里启动 vLLM，供 GRPO 训练侧调用：
+#   --vqa_backend vllm_openai（首 token logprob）或 vllm_openai_structured（<Thought>+<Answer>yes|no</Answer>，默认开 thinking）。
 # 勿与 vehicle-design-train 训练用 .venv 混装 vLLM（避免与 diffusers/torch 版本冲突）。
 #
 # 一次性准备示例（目录可改）：
@@ -59,7 +60,8 @@ if [[ -n "${VLLM_CUDA_VISIBLE_DEVICES:-}" ]]; then
 fi
 
 echo "[launch_vllm] venv=$VENV_PATH model=$MODEL host=$HOST port=$PORT tp=$TP max_model_len=$MAX_LEN CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}" >&2
-echo "[launch_vllm] OpenAI base for GRPO: http://127.0.0.1:${PORT}/v1  (本机)  训练加: --vqa_backend vllm_openai --vqa_model $MODEL" >&2
+echo "[launch_vllm] OpenAI base: http://127.0.0.1:${PORT}/v1  示例: --vqa_backend vllm_openai --vqa_model $MODEL" >&2
+echo "[launch_vllm] 结构化 VQA: --vqa_backend vllm_openai_structured（需 --reasoning-parser，如已设 VLLM_REASONING_PARSER）" >&2
 
 exec vllm serve "$MODEL" \
   --host "$HOST" \

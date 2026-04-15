@@ -18,6 +18,7 @@ dependencies = [
     "pillow>=10.0.0",
     "python-dotenv>=1.2.2",
     "safetensors>=0.4.0",
+    "sentencepiece>=0.1.99",
     "setuptools>=69.0.0,<81",
     "tensorboard>=2.14.0",
     "torch>=2.2.0",
