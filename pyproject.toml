@@ -9,7 +9,7 @@ dependencies = [
     "clip",
     "dashscope>=1.25.16",
     "datasets>=3.0.0",
-    "diffusers>=0.32.0,<0.34.0",
+    "diffusers>=0.37.0,<0.40.0",
     "image-reward>=1.5",
     "numpy>=1.26.0",
     "openai>=1.40.0",
@@ -23,7 +23,7 @@ dependencies = [
     "torch>=2.2.0",
     "torchvision>=0.17.0",
     "tqdm>=4.66.0",
-    "transformers>=4.44.0,<4.47.0",
+    "transformers>=4.48.0,<5.0.0",
     "trl>=0.12.0",
 ]
 
@@ -54,3 +54,4 @@ vdt-token-stats = "vehicle_design_train.token_stats:main"
 vdt-eval-grid = "vehicle_design_train.eval_grid:main"
 vdt-eval-metrics = "vehicle_design_train.eval_metrics:main"
 vdt-train-sdxl-grpo = "vehicle_design_train.train_sdxl_grpo:main"
+vdt-train-sd3-grpo = "vehicle_design_train.train_sd3_grpo:main"
