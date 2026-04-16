@@ -1,175 +1,201 @@
 # vehicle-design-train
 
-基于本地 **Stable Diffusion XL Base 1.0** 与车辆标注 `processed.jsonl` 的 **UNet LoRA** 微调（Diffusers 官方 `train_text_to_image_lora_sdxl` 逻辑，已内嵌并支持 `--annotation_jsonl`）。
+面向车辆生成任务的 **Stable Diffusion 3.5 Medium（SD3.5 Medium）** 训练仓库，包含两条主线：
 
-## 环境
+1. **监督式 LoRA 微调（SFT）**：`vehicle_design_train.train_sd3_lora`
+2. **Flow-GRPO 后训练**：`vehicle_design_train.train_sd3_grpo`
+
+> ⚠️ **SDXL 路线已废弃（deprecated）**：仓库中与 SDXL 相关的脚本/实现仅为历史保留，不再维护，也不建议继续使用。
+
+---
+
+## 1) 环境准备
 
 - Python 3.12+
-- [uv](https://github.com/astral-sh/uv)；默认 PyPI 镜像在 [`pyproject.toml`](pyproject.toml) 中配置为阿里云，`torch` / `torchvision` 从 PyTorch CUDA 12.4 轮子索引安装。
+- [uv](https://github.com/astral-sh/uv)
 
 ```bash
-cd /path/to/vehicle-design-train
+cd /workspace/vehicle-design-train
 uv sync
 ```
 
-## 数据
-
-- 标注：`~/data/data/annotation_state/default/processed.jsonl`（或任意路径）
-- 默认过滤：`error` 为空、`car_count == 1`、`person_count == 0`；caption 由 `--caption_field` 指定（如 `positive_prompt_en` 或 `caption_en_short`）
-- 可选：`--require_complete_vehicle`、`--image_path_prefix_old` / `--image_path_prefix_new` 重写图片绝对路径前缀
-
-## Caption 长度（CLIP 77 token）
-
-```bash
-uv run vdt-token-stats \
-  --annotation-jsonl "$HOME/data/data/annotation_state/default/processed.jsonl" \
-  --pretrained-model /public/huggingface-models/stabilityai/stable-diffusion-xl-base-1.0 \
-  --max-samples 2000
-```
-
-## 训练（导出目录建议）
-
-将 `--output_dir` 指到 `~/data/train/sdxl/runs/<run_name>/`。
-
-```bash
-mkdir -p "$HOME/data/train/sdxl/runs/run1"
-
-uv run accelerate launch --mixed_precision=bf16 -m vehicle_design_train.train_sdxl_lora \
-  --pretrained_model_name_or_path=/public/huggingface-models/stabilityai/stable-diffusion-xl-base-1.0 \
-  --annotation_jsonl="$HOME/data/data/annotation_state/default/processed.jsonl" \
-  --output_dir="$HOME/data/train/sdxl/runs/run1" \
-  --report_to=tensorboard --logging_dir=logs \
-  --resolution=1024 --center_crop \
-  --train_batch_size=1 --gradient_accumulation_steps=4 \
-  --learning_rate=1e-4 --rank=16 \
-  --checkpointing_steps=500 \
-  --num_train_epochs=3 \
-  --validation_prompt_file=./config/validation_prompts.json \
-  --num_validation_images=2 \
-  --validation_steps=500 \
-  --seed=42
-```
-
-首次使用请配置 Accelerate（交互或默认）：
+首次使用 Accelerate：
 
 ```bash
 uv run accelerate config
 ```
 
-### 双卡（例如 2×NVIDIA A16，各约 16GB）
+---
 
-**重要**：两块 16GB 是 **两张卡各 16GB**，不是一张 32GB。多卡 **DDP** 会在每张卡上各放一份模型，显存 **不能相加**；双卡主要提高吞吐，并让 **全局 batch ≈ `train_batch_size × GPU 数 × gradient_accumulation_steps`**。
+## 2) 数据准备
 
-- 推荐直接用仓库脚本（已带 **`--gradient_checkpointing`**，双卡时把梯度累积略减为 2，全局等效 batch 仍为约 4；可按需改回 4）：
+### 2.1 SD3.5 LoRA 微调数据（annotation jsonl）
 
-```bash
-chmod +x scripts/launch_train_sdxl_2gpu.sh
-./scripts/launch_train_sdxl_2gpu.sh
-```
+- 典型文件：`~/data/data/annotation_state/default/processed.jsonl`
+- 常用字段：
+  - 图像路径
+  - caption（默认示例脚本使用 `caption_en_short`）
+- 训练脚本支持常见过滤与路径重写参数（例如完整车体过滤、路径前缀替换等）。
 
-- 或手动（指定 2 进程 + 多卡）：
+### 2.2 Flow-GRPO 数据（v3 jsonl）
 
-```bash
-CUDA_VISIBLE_DEVICES=0,1 uv run accelerate launch --num_processes=2 --multi_gpu --mixed_precision=bf16 \
-  -m vehicle_design_train.train_sdxl_lora \
-  ... # 其余参数同单卡，并务必加上 --gradient_checkpointing
-```
+- 默认示例：`data/train.jsonl`
+- 必需字段：
+  - `prompt_en`（可通过 `--prompt_field` 修改）
+  - `judge_requirements.judge_questions`（用于 VQA/规则打分）
 
-若仍显存不足：把 **`--resolution 768`**，或安装 **xformers** 后增加 **`--enable_xformers_memory_efficient_attention`**（需环境与包可用）。
+---
 
-`accelerate config` 里选择 **multi-GPU**、进程数 **2** 后，也可继续用单卡启动命令，由配置文件决定进程数（与命令行 `--num_processes` 二选一、勿混用冲突即可）。
+## 3) SD3.5 Medium 监督式 LoRA 微调（重点）
 
-## 验证频率
+主脚本：`vehicle_design_train/train_sd3_lora.py`
 
-- **`--validation_steps N`（`N > 0`）**：每 **N 个全局 optimizer step** 做一次出图验证（TensorBoard / W&B 的横轴为 **global_step**）。启动脚本默认 `500`。
-- **`--validation_steps 0`**（默认）：按 **`--validation_epochs`** 每个 epoch 结束验证（旧行为）。
-
-## 多组验证 Prompt（奔驰 / 宝马 / 奥迪 / 大众等）
-
-- **`--validation_prompt_file`**：指向 JSON，可为字符串列表，或 `{"prompts": [...]}`；每条支持 `{"id": "tensorboard子标签", "text": "英文 prompt"}`（`prompt` / `caption` 字段也可作为正文）。
-- 默认示例：[`config/validation_prompts.json`](config/validation_prompts.json)（含四家品牌 + 多视角/细节；其中 **`vw_hatch_rear34_detail`** 对应「大众深灰掀背、后 45°、贯穿尾灯、黑轮毂」类描述）。
-- **`--num_validation_images`**：对每个 prompt 各生成几张图；多 prompt 时显存与时间线性增长，启动脚本默认 **`2`**。
-- 未指定文件时仍可用单行 **`--validation_prompt`**。
-- TensorBoard **IMAGES** 里按标签 **`validation/<id>`** 分开展示（如 `validation/mercedes_suv_front`）。
-- 验证时终端会显示 **两层进度**：外层按 prompt、内层按每张图；单次 `pipeline` 推理仍会显示 Diffusers 自带的 **去噪步数** 进度条。
-
-## TensorBoard
-
-训练脚本默认 **`--report_to=tensorboard`**，项目已声明依赖 **`tensorboard`**，用于记录 `train_loss`、`lr` 等；验证出图时也会写入 TensorBoard 图像（见脚本中 `log_validation`）。
-
-日志写在 **`$OUTPUT_DIR/logs/`** 下（由 `--logging_dir` 控制，默认 `logs`）。TensorBoard 会递归读取子目录中的事件文件：
+推荐直接使用仓库启动脚本（已包含一组保守显存参数）：
 
 ```bash
-uv run tensorboard --logdir "$HOME/data/train/sdxl/runs/run1/logs" --port 6006
+chmod +x scripts/launch_train_sd3.sh
+./scripts/launch_train_sd3.sh
 ```
 
-（必须提供 **`--logdir`** 指向某次 run 的 `logs` 目录；仅写 `--port` 会找不到数据。）
+### 3.1 默认配置说明（`scripts/launch_train_sd3.sh`）
 
-若启动 TensorBoard 时报错 **`No module named 'pkg_resources'`**：本项目已在依赖里固定 **`setuptools<81`**（TensorBoard 仍依赖 `pkg_resources`；setuptools 82+ 在部分环境下不可用）。在项目根执行 **`uv sync`** 后再运行上述命令。
+- 基座模型：`stable-diffusion-3.5-medium`
+- 分辨率：`1024`
+- `train_batch_size=2`
+- `gradient_accumulation_steps=8`
+- `gradient_checkpointing` 开启
+- LoRA rank：`16`
+- 混合精度：`bf16`
+- 日志：TensorBoard（`$OUT/logs`）
 
-改用 Weights & Biases 时传 **`--report_to=wandb`**（需自行安装并登录 `wandb`）。
+可用环境变量覆盖：
 
-## 推理网格（基座 + LoRA）
+- `SD3_BASE`：SD3.5 Medium 模型路径
+- `VEHICLE_ANNOTATION_JSONL`：训练标注 jsonl
+- `SD3_OUTPUT_DIR`：输出目录
+
+也可继续在命令后附加参数覆写默认值，例如：
 
 ```bash
-mkdir -p "$HOME/data/train/sdxl/samples/grid1"
-
-uv run vdt-eval-grid \
-  --pretrained-model /public/huggingface-models/stabilityai/stable-diffusion-xl-base-1.0 \
-  --lora-path "$HOME/data/train/sdxl/runs/run1" \
-  --prompts-json ./config/eval_prompts.json \
-  --out-dir "$HOME/data/train/sdxl/samples/grid1"
+./scripts/launch_train_sd3.sh --num_train_epochs=3 --validation_steps=100
 ```
 
-## GRPO / DDPO 风格后训练（实验性）
+### 3.2 训练产物
 
-在监督 LoRA 之后，可用 **`train_sdxl_grpo`** 做「每组 **G** 张 rollout → **ImageReward** + **百炼多模态 VQA（logprob → VQAScore 语义）** → 组内相对优势 → **DDIM 高斯 log-prob 的 DDPO 裁剪损失**」更新 UNet LoRA（见仓库内实现与 [Diffusers DDPO 说明](https://huggingface.co/docs/diffusers/training/ddpo)）。
+训练目录中通常包含：
 
-- **数据**：v3 JSONL，默认字段 **`prompt_en`**；**`judge_requirements.judge_questions`**（`question_en` / `expected_answer`）。实现中会**额外**增加一道英文整段题：*`Does this image reflect the following description: "{prompt_en}"? Please answer yes or no.`*（模板可用 `--global_question_template_en` 覆盖）。
-- **环境变量**：**`DASHSCOPE_API_KEY`**（百炼）；可选 **`VQA_MODEL`**、**`VQA_MAX_WORKERS`**（并发 VQA 请求数，与 **`--vqa_max_workers`** 一致；同一组 **G** 张图上的 global + judge 题会打进同一线程池统一调度）。无密钥时用 **`--skip_vqa`** 仅跑 ImageReward（或两者都关：`--skip_vqa --skip_imagereward` 仅测管线）。
-- **本地 vLLM（Qwen3.5）**：在**单独目录**用 **uv venv** 安装 vLLM（勿与训练 venv 混用），见 [Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B)。可用仓库脚本一键启动（默认读取 **`$HOME/vllm-serve/.venv`**，可用 **`VLLM_ROOT` / `VLLM_VENV`** 覆盖）：  
-  `chmod +x scripts/launch_vllm_qwen35_grpo_vqa.sh && ./scripts/launch_vllm_qwen35_grpo_vqa.sh`  
-  等价于在独立 venv 中执行 `vllm serve`（默认 **`VLLM_MAX_MODEL_LEN=32768`** 省显存；满上下文可设 **`VLLM_MAX_MODEL_LEN=262144`** 等）。训练侧 **`--vqa_backend vllm_openai --vqa_model Qwen/Qwen3.5-9B`**，**`OPENAI_BASE_URL`** 指向 `http://127.0.0.1:8000/v1`（或 **`--vqa_openai_base_url`**），**`OPENAI_API_KEY`** 多为 **`EMPTY`**。默认关闭 Qwen3.5 thinking（便于 Yes/No 首 token logprob）；需要思维链时加 **`--vqa_enable_thinking`**。  
-  也可在项目根目录 **`.env`** 中写一行 `DASHSCOPE_API_KEY=你的密钥`（已在 `.gitignore`）：**`train_sdxl_grpo` 启动时会用 `python-dotenv` 加载**；用 **`scripts/launch_train_sdxl_grpo.sh`** 时脚本还会 **`source` 该 `.env`**，避免子进程拿不到变量。  
-  **双卡示例（GPU0 只跑 vLLM，GPU1 上 SDXL rollout+训练）**：终端 1：`VLLM_CUDA_VISIBLE_DEVICES=0 ./scripts/launch_vllm_qwen35_grpo_vqa.sh`；终端 2：`export GRPO_GPU_IDS=1 GRPO_NUM_PROCESSES=1 OPENAI_BASE_URL=http://127.0.0.1:8000/v1`，训练命令加 **`--vqa_backend vllm_openai --vqa_model Qwen/Qwen3.5-9B`**（模型名与 vLLM 一致）。**不要**设 **`GRPO_NUM_INFERENCE_PROCESSES`**（单卡用默认即可，脚本仅在多进程且显式设置时才启用 split）。
-- **显存**：约等于「SDXL 推理 × **G** + ImageReward + 反传」；可调小 **`--resolution`**、**`--group_size`**、**`--sample_num_steps`**、**`--train_timestep_fraction`**，并建议 **`--gradient_checkpointing`**。
-- **Batch**：**`--rollout_batch_size`** 控制同一条 prompt 下 **一次 UNet 前向并行生成几张图**（推理显存随并行度上升）；**`--train_batch_size`** 控制 **DDPO 损失/反传时的微批大小**（与 rollout 独立）。`rollout_batch_size` 会自动不超过 **`group_size`**。
-- **多卡分组（实验性）**：支持把进程拆成「前半组 rollout/reward，后半组 DDP 训练」。当前实现要求 **推理进程数 == 训练进程数**（一对一配对）；若样本数不能整除组数，会在每个 epoch 丢弃少量尾样本。  
-  **不同物理 GPU**：在 **`--split_infer_train`** 下可设 **`GRPO_ROLLOUT_GPU_IDS`** 与 **`GRPO_TRAIN_GPU_IDS`**（或 **`--rollout_gpu_ids` / `--train_gpu_ids`**），逗号分隔、顺序与 rank 对应；每个进程在 `Accelerator` 之前单独 **`CUDA_VISIBLE_DEVICES`** 为一张卡。例：4 进程、2 推理 + 2 训练：`GRPO_ROLLOUT_GPU_IDS=2,3`，`GRPO_TRAIN_GPU_IDS=0,1`。非 split 时仍可用 **`GRPO_GPU_IDS`** 统一限制可见 GPU。  
-  （若想要「1 张 rollout + 多张 train」等非对称进程数，需改通信/配对逻辑，当前未支持。）
-- **启动示例**：[scripts/launch_train_sdxl_grpo.sh](scripts/launch_train_sdxl_grpo.sh)（可按需改 `SDXL_BASE`、`GRPO_JSONL`、`SDXL_GRPO_OUTPUT`）。非 split 时 **`GRPO_GPU_IDS`** 会 **`export CUDA_VISIBLE_DEVICES`**；split 且同时设 **`GRPO_TRAIN_GPU_IDS` + `GRPO_ROLLOUT_GPU_IDS`** 时由训练脚本按 rank 分配（勿再设 `GRPO_GPU_IDS`）。**`GRPO_NUM_PROCESSES`** 为 Accelerate 进程数。
+- LoRA 权重与 checkpoint
+- TensorBoard 日志（标量与验证图）
+
+查看日志：
 
 ```bash
-chmod +x scripts/launch_train_sdxl_grpo.sh
-export DASHSCOPE_API_KEY="your-key"
-./scripts/launch_train_sdxl_grpo.sh \
-  --grpo_jsonl /path/to/train.jsonl \
-  --output_dir "$HOME/data/train/sdxl_grpo/run1"
+uv run tensorboard --logdir "$HOME/data/train/sd3/runs/<run_name>/logs" --port 6006
 ```
 
-四卡示例（2 卡推理 + 2 卡训练）：
+---
+
+## 4) SD3.5 Medium + Flow-GRPO 后训练（重点）
+
+主脚本：`vehicle_design_train/train_sd3_grpo.py`
+
+该实现是 **SD3 Flow-Match 路线的 GRPO 风格后训练**，核心流程：
+
+1. 对每条 prompt 采样一组 `group_size=G` 张图（rollout）
+2. 使用奖励模型计算每张图的 reward（可组合）
+3. 组内计算 advantage（相对优势）
+4. 使用 Flow-GRPO clipped objective 更新 LoRA 参数
+
+推荐从脚本启动：
 
 ```bash
-export DASHSCOPE_API_KEY="your-key"
-export GRPO_NUM_PROCESSES=4
-export GRPO_NUM_INFERENCE_PROCESSES=2
-export GRPO_TRAIN_GPU_IDS=0,1
-export GRPO_ROLLOUT_GPU_IDS=2,3
-./scripts/launch_train_sdxl_grpo.sh \
-  --grpo_jsonl /path/to/train.jsonl \
-  --output_dir "$HOME/data/train/sdxl_grpo/run_split_2x2"
+chmod +x scripts/launch_train_sd3_grpo.sh
+./scripts/launch_train_sd3_grpo.sh
 ```
 
-- **可选 LoRA 起点**：**`--lora_path`** 指向此前保存的 **`unet_lora.safetensors`**（本脚本保存格式）或 Diffusers 兼容目录；**`--merge_lora_into_unet`** 会先融合再挂新 LoRA（显存更高，慎用）。
+### 4.1 默认配置说明（`scripts/launch_train_sd3_grpo.sh`）
 
-## 可选 CLIP 打分
+脚本默认采用一套偏“可跑通 + 可观察”的设置：
 
-需为每张图提供 `manifest`（文件名与 prompt 对齐）时使用 `--manifest-json`。
+- `--flow_grpo_fast`
+- `--fast_sde_window_size=2`
+- `--group_size=8`
+- `--rollout_batch_size=8`
+- `--train_batch_size=8`
+- `--sample_num_steps=10`
+- `--train_timestep_fraction=0.25`
+- `--noise_level=0.7`
+- `--max_sequence_length=256`
+- `--gradient_checkpointing`
+
+并默认开启 rollout 可视化日志（JSON/TensorBoard，可选存图）。
+
+### 4.2 奖励与打分
+
+当前训练入口支持组合奖励（按权重求和），包括：
+
+- ImageReward
+- VQA 概率打分（DashScope 或 vLLM OpenAI 兼容后端）
+- GenEval 远程打分（可选）
+
+默认脚本参数中：
+
+- `--weight_ir=1`
+- `--weight_vqa=0`
+
+即默认主要依赖 ImageReward。你可以在启动命令中开启并调高 VQA 权重。
+
+### 4.3 多卡与 split 推理/训练
+
+当 `GRPO_NUM_PROCESSES>=2` 时，脚本会用 accelerate 多进程。
+
+可选 split 模式（部分进程 rollout，部分进程 train）：
+
+- `GRPO_NUM_INFERENCE_PROCESSES`
+- `GRPO_TRAIN_GPU_IDS`
+- `GRPO_ROLLOUT_GPU_IDS`
+
+不 split 时可直接用：
+
+- `GRPO_GPU_IDS`
+
+### 4.4 常用环境变量
+
+- `GRPO_JSONL`：GRPO 训练 jsonl
+- `SD3_GRPO_OUTPUT`：输出目录
+- `SD3_GRPO_LORA_PATH`：从已有 LoRA 初始化
+- `GRPO_NUM_PROCESSES`：总进程数
+- `GRPO_NUM_INFERENCE_PROCESSES`：split 模式下推理进程数
+- `SD3_LOG_IMAGE_STEPS`：rollout 日志频率
+- `SD3_MAX_LOGGED_IMAGES`：每次记录的最大图数
+- `SD3_SAVE_ROLLOUT_SAMPLE_IMAGES=0/1`：是否保存 rollout 图
+
+### 4.5 一个实用启动示例
 
 ```bash
-uv run vdt-eval-metrics --images-dir "$HOME/data/train/sdxl/samples/grid1" --manifest-json path/to/manifest.json
+export GRPO_JSONL=/path/to/train.jsonl
+export SD3_GRPO_OUTPUT=$HOME/data/train/sd3_grpo/run1
+export GRPO_NUM_PROCESSES=1
+
+./scripts/launch_train_sd3_grpo.sh \
+  --weight_vqa=1 \
+  --vqa_backend=vllm_openai \
+  --vqa_model=Qwen/Qwen3.5-9B
 ```
 
-## 许可证
+---
 
-内嵌训练脚本版权归 Hugging Face（Apache 2.0）；请参阅文件头注释。
+## 5) 目录速览（SD3 主链路）
+
+- `vehicle_design_train/train_sd3_lora.py`：SD3.5 LoRA SFT
+- `vehicle_design_train/train_sd3_grpo.py`：SD3 Flow-GRPO 后训练
+- `vehicle_design_train/grpo/sd3_rollout.py`：SD3 rollout 逻辑
+- `vehicle_design_train/grpo/sd3_flow_grpo_loss.py`：Flow-GRPO loss
+- `scripts/launch_train_sd3.sh`：SFT 启动脚本
+- `scripts/launch_train_sd3_grpo.sh`：GRPO 启动脚本
+
+---
+
+## 6) 许可证
+
+内嵌训练脚本包含基于 Hugging Face Diffusers（Apache 2.0）改造的实现；请遵循各依赖与基座模型许可证。
