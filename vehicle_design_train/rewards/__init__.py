@@ -1,1 +1,1 @@
-"""Reward models for GRPO (ImageReward + DashScope VQA probabilities)."""
+"""Reward models for GRPO (ImageReward, VQA log-probs, PickScore, GenEval remote)."""

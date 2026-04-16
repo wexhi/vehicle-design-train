@@ -3,7 +3,9 @@ set -euo pipefail
 
 # GRPO-style post-training: group rollouts + ImageReward + DashScope VQA (prob) + DDPO loss.
 # Requires DASHSCOPE_API_KEY unless --skip_vqa. ImageReward needs GPU memory in addition to SDXL.
-# --log_image_steps>0：整组每条 rollout 的 r_total/r_ir/r_vqa/advantage 写入 JSON 与 TensorBoard；若要另存 PNG/TB 图像面板请加 --save_rollout_sample_images。
+# TensorBoard 根目录：$OUT/logs_grpo。
+# --log_image_steps>0：整组每条 rollout 的 r_total/r_ir/r_vqa/advantage 写入 JSON 与 TensorBoard；若要另存 PNG/TB 图像面板请加 --save_rollout_sample_images（与 train_sd3_grpo 一致）。
+# 可选环境变量（SD3 启动脚本已对齐）：SDXL_LOG_IMAGE_STEPS、SDXL_MAX_LOGGED_IMAGES；SDXL_SAVE_ROLLOUT_SAMPLE_IMAGES=0 关闭存图与 TB 图像面板。
 # DDPO 时间步：默认 --train_timestep_sample_mode=group_shared_stratified（组内共享索引 + 高/中/低噪声分层）；旧行为加 --train_timestep_sample_mode=independent。
 # 若用 group_shared_uniform 且 K<T，可加 --train_timestep_unbiased_scale 对 loss 乘 T/K（有效梯度变大，常需略降 LR）。
 # 断点：--checkpointing_steps=N 每 N 个全局 optimizer step 写入 output_dir/checkpoint-{step}/（unet_lora.safetensors + training_state.pt）。
@@ -37,6 +39,17 @@ GRPO_GPU_IDS="${GRPO_GPU_IDS:-1}"
 # 当前实现要求 推理进程数 == 训练进程数（例如 2+2）：例 rollout 用 2,3、train 用 0,1。
 GRPO_TRAIN_GPU_IDS="${GRPO_TRAIN_GPU_IDS:-}"
 GRPO_ROLLOUT_GPU_IDS="${GRPO_ROLLOUT_GPU_IDS:-}"
+SDXL_LOG_IMAGE_STEPS="${SDXL_LOG_IMAGE_STEPS:-2}"
+SDXL_MAX_LOGGED_IMAGES="${SDXL_MAX_LOGGED_IMAGES:-4}"
+SDXL_SAVE_ROLLOUT_SAMPLE_IMAGES="${SDXL_SAVE_ROLLOUT_SAMPLE_IMAGES:-1}"
+
+TB_ROLLOUT_ARGS=(
+  --log_image_steps="$SDXL_LOG_IMAGE_STEPS"
+  --max_logged_images="$SDXL_MAX_LOGGED_IMAGES"
+)
+if [[ "$SDXL_SAVE_ROLLOUT_SAMPLE_IMAGES" != "0" ]]; then
+  TB_ROLLOUT_ARGS+=(--save_rollout_sample_images)
+fi
 
 if [[ -n "$GRPO_TRAIN_GPU_IDS" && -n "$GRPO_ROLLOUT_GPU_IDS" ]]; then
   export GRPO_TRAIN_GPU_IDS GRPO_ROLLOUT_GPU_IDS
@@ -81,9 +94,7 @@ exec uv run accelerate launch "${ACCELERATE_ARGS[@]}" -m vehicle_design_train.tr
   --vqa_max_workers=128 \
   --gradient_checkpointing \
   --save_steps=50 \
-  --log_image_steps=2 \
   --logging_steps=1 \
-  --max_logged_images=4 \
-  --save_rollout_sample_images \
+  "${TB_ROLLOUT_ARGS[@]}" \
   "${TRAIN_ARGS[@]}" \
   "$@"

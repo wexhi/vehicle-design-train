@@ -1,5 +1,10 @@
 #!/usr/bin/env python
-"""SDXL LoRA post-training with GRPO-style group advantages + DDPO loss (DDIM log-probs)."""
+"""SD3.5 LoRA post-training with GRPO-style advantages + Flow-GRPO clipped loss.
+
+SDE step + log-prob match yifan123/flow_grpo `sd3_sde_with_logprob.py` (ODE→SDE discretization).
+Optional Flow-GRPO-Fast follows `sd3_pipeline_with_logprob_fast.py` (ODE prefix + short SDE window).
+Scheduler does not use `stochastic_sampling`; see `vehicle_design_train/grpo/sd3_sde_with_logprob.py`.
+"""
 
 from __future__ import annotations
 
@@ -22,7 +27,8 @@ import torch.distributed as dist
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
-from diffusers import DDIMScheduler, StableDiffusionXLPipeline
+from diffusers import FlowMatchEulerDiscreteScheduler, StableDiffusion3Pipeline
+from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import retrieve_timesteps
 from peft import LoraConfig, get_peft_model
 from peft.utils import get_peft_model_state_dict
 from PIL import Image, ImageDraw, ImageFont
@@ -31,9 +37,10 @@ from torch.utils.tensorboard import SummaryWriter
 from torchvision.transforms.functional import pil_to_tensor
 from tqdm.auto import tqdm
 
+from vehicle_design_train.grpo.ddp_utils import unwrap_module
 from vehicle_design_train.grpo.group_advantage import compute_group_advantages
-from vehicle_design_train.grpo.sdxl_ddpo_loss import sdxl_ddpo_calculate_loss
-from vehicle_design_train.grpo.sdxl_rollout import ensure_ddim_scheduler, sdxl_ddim_rollout_parallel
+from vehicle_design_train.grpo.sd3_flow_grpo_loss import sd3_flow_grpo_calculate_loss
+from vehicle_design_train.grpo.sd3_rollout import ensure_flow_match_scheduler, sd3_flow_rollout_parallel
 from vehicle_design_train.grpo_dataset import list_grpo_jsonl
 from vehicle_design_train.rewards.composite import combine_rewards
 from vehicle_design_train.rewards.imagereward_scorer import ImageRewardScorer
@@ -135,7 +142,7 @@ _ROLLOUT_TENSOR_KEYS = [
     "negative_prompt_embeds",
     "pooled_prompt_embeds",
     "negative_pooled_prompt_embeds",
-    "add_time_ids",
+    "rollout_mu",
     "reward_metrics",
     "rollout_r_total",
     "rollout_r_ir",
@@ -200,39 +207,95 @@ class SplitRoleConfig:
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="SDXL GRPO-style RL fine-tuning (DDPO + group advantages)")
-    p.add_argument("--pretrained_model_name_or_path", type=str, required=True)
+    p = argparse.ArgumentParser(description="SD3 Flow-Match GRPO-style RL fine-tuning (Flow-GRPO + group advantages)")
+    p.add_argument(
+        "--pretrained_model_name_or_path",
+        type=str,
+        default="/public/huggingface-models/stabilityai/stable-diffusion-3.5-medium",
+        help="Diffusers-format SD3 / SD3.5 folder (local or Hub id).",
+    )
     p.add_argument(
         "--grpo_jsonl",
         type=str,
         required=True,
-        help="v3 JSONL: prompt_en, judge_requirements; optional geneval=... for --vqa_backend=geneval_remote",
+        help="v3 JSONL: prompt_en, judge_requirements.judge_questions; optional geneval={tag,include,prompt,...} for --vqa_backend=geneval_remote",
     )
     p.add_argument("--prompt_field", type=str, default="prompt_en")
     p.add_argument("--output_dir", type=str, required=True)
     p.add_argument("--lora_path", type=str, default=None, help="Optional existing LoRA weights directory or .safetensors")
     p.add_argument("--lora_rank", type=int, default=16)
-    p.add_argument("--merge_lora_into_unet", action="store_true", help="Fuse LoRA into UNet then attach new trainable LoRA")
+    p.add_argument(
+        "--merge_lora_into_transformer",
+        action="store_true",
+        help="Fuse LoRA into transformer then attach new trainable LoRA",
+    )
     p.add_argument("--resolution", type=int, default=1024)
     p.add_argument("--group_size", type=int, default=4, help="G rollouts per prompt (GRPO group)")
     p.add_argument(
         "--rollout_batch_size",
         type=int,
         default=1,
-        help="Parallel images per UNet forward during rollout (1 = sequential). Capped by group_size.",
+        help="Parallel images per transformer forward during rollout (1 = sequential). Capped by group_size.",
     )
     p.add_argument("--num_epochs", type=int, default=1)
     p.add_argument("--max_samples_per_epoch", type=int, default=None)
     p.add_argument("--sample_num_steps", type=int, default=20)
-    p.add_argument("--sample_eta", type=float, default=1.0)
-    p.add_argument("--sample_guidance_scale", type=float, default=7.0)
+    p.add_argument(
+        "--noise_level",
+        type=float,
+        default=0.7,
+        help="Flow-GRPO SDE noise scale (same as flow_grpo config.sample.noise_level; typical 0.7–0.8).",
+    )
+    p.add_argument(
+        "--sde_type",
+        type=str,
+        default="sde",
+        choices=["sde", "cps"],
+        help="sde=official ODE→SDE step; cps=coefficients-preserving sampling (flow_grpo sd3_sde_with_logprob).",
+    )
+    p.add_argument(
+        "--flow_grpo_fast",
+        action="store_true",
+        help="Flow-GRPO-Fast: one shared ODE trajectory to a random step, then SDE group branch for 1–2 steps (flow_grpo sd3_pipeline_with_logprob_fast).",
+    )
+    p.add_argument(
+        "--fast_sde_window_size",
+        type=int,
+        default=2,
+        help="Contiguous denoise indices to run SDE (1 or 2 typical). 0 = official full SDE except last step (same as upstream window_size=0).",
+    )
+    p.add_argument(
+        "--fast_sde_range_lo",
+        type=int,
+        default=0,
+        help="Inclusive lower bound for random SDE window start index.",
+    )
+    p.add_argument(
+        "--fast_sde_range_hi",
+        type=int,
+        default=-1,
+        help="Exclusive upper bound for window placement (same semantics as flow_grpo sde_window_range[1]); -1 uses num_inference_steps.",
+    )
+    p.add_argument("--sample_guidance_scale", type=float, default=4.5)
+    p.add_argument(
+        "--max_sequence_length",
+        type=int,
+        default=256,
+        help="T5 / encode_prompt max length (SD3; HF recommends 256 or 512 for long prompts).",
+    )
+    p.add_argument(
+        "--train_flow_steps",
+        type=int,
+        default=None,
+        help="If set, policy-update timestep indices are drawn only from the first min(T, train_flow_steps) transitions.",
+    )
     p.add_argument("--negative_prompt", type=str, default="")
     p.add_argument("--train_learning_rate", type=float, default=1e-5)
     p.add_argument(
         "--train_batch_size",
         type=int,
         default=1,
-        help="Micro-batch size for DDPO loss / optimizer.step (independent from rollout_batch_size)",
+        help="Micro-batch size for Flow-GRPO loss / optimizer.step (independent from rollout_batch_size)",
     )
     p.add_argument(
         "--gradient_accumulation_steps",
@@ -250,14 +313,14 @@ def parse_args():
         type=str,
         default="group_shared_stratified",
         choices=["independent", "group_shared_uniform", "group_shared_stratified"],
-        help="How to pick DDPO timestep indices: independent=per-rollout randperm (legacy); "
+        help="How to pick timestep indices for policy update: independent=per-rollout randperm (legacy); "
         "group_shared_*=same K indices for the whole GRPO group (lower variance). "
         "Stratified splits trajectory index ~high/mid/low noise then samples within each bucket.",
     )
     p.add_argument(
         "--train_timestep_unbiased_scale",
         action="store_true",
-        help="If set with --train_timestep_sample_mode=group_shared_uniform and K<T, scale DDPO loss/approx_kl by T/K "
+        help="If set with --train_timestep_sample_mode=group_shared_uniform and K<T, scale loss/approx_kl by T/K "
         "(Monte Carlo correction toward full-trajectory sum; not valid for stratified).",
     )
     p.add_argument("--train_num_inner_epochs", type=int, default=1)
@@ -266,7 +329,7 @@ def parse_args():
         "--weight_vqa",
         type=float,
         default=0.5,
-        help="Weight for second reward: LLM VQA log-probs, or PickScore if --vqa_backend=pickscore (Flow-GRPO). "
+        help="Second reward weight: LLM VQA log-probs, PickScore (--vqa_backend=pickscore), or GenEval server (--vqa_backend=geneval_remote). "
         "Use 0 to skip loading/calling any VQA backend (no DashScope, vLLM, PickScore, or GenEval).",
     )
     p.add_argument("--vqa_global_weight", type=float, default=1.0)
@@ -276,7 +339,7 @@ def parse_args():
         type=str,
         default="dashscope",
         choices=["dashscope", "vllm_openai", "vllm_openai_structured", "pickscore", "geneval_remote"],
-        help="vllm_openai=logprob; vllm_openai_structured=<Thought>+<Answer>yes|no</Answer>; pickscore; geneval.",
+        help="vllm_openai=logprob; vllm_openai_structured=<Thought>+<Answer>yes|no</Answer> (default thinking on); pickscore; geneval.",
     )
     p.add_argument(
         "--vqa_model",
@@ -299,44 +362,80 @@ def parse_args():
     p.add_argument(
         "--vqa_enable_thinking",
         action="store_true",
-        help="vllm_openai (logprob): enable thinking (default off).",
+        help="Qwen3 on vLLM (vllm_openai logprob backend only): enable thinking in chat_template (default off).",
     )
-    p.add_argument("--vqa_structured_max_tokens", type=int, default=4096)
-    p.add_argument("--vqa_structured_temperature", type=float, default=0.0)
+    p.add_argument(
+        "--vqa_structured_max_tokens",
+        type=int,
+        default=4096,
+        help="vllm_openai_structured: max completion tokens (room for <Thought> + <Answer>).",
+    )
+    p.add_argument(
+        "--vqa_structured_temperature",
+        type=float,
+        default=0.0,
+        help="vllm_openai_structured: sampling temperature (0 = greedy).",
+    )
     p.add_argument(
         "--vqa_structured_disable_thinking",
         action="store_true",
-        help="vllm_openai_structured: disable enable_thinking on vLLM.",
+        help="vllm_openai_structured: turn off chat_template_kwargs.enable_thinking on vLLM.",
     )
-    p.add_argument("--vqa_structured_timeout_sec", type=float, default=300.0)
+    p.add_argument(
+        "--vqa_structured_timeout_sec",
+        type=float,
+        default=300.0,
+        help="vLLM HTTP timeout for structured VQA (longer generations).",
+    )
     p.add_argument(
         "--vqa_max_workers",
         type=int,
         default=8,
-        help="Concurrent VQA HTTP calls per rollout group (ignored for pickscore).",
+        help="Concurrent VQA HTTP calls per rollout group (DashScope or OpenAI client; ignored for pickscore).",
     )
     p.add_argument(
         "--pickscore_processor_id",
         type=str,
         default="laion/CLIP-ViT-H-14-laion2B-s32B-b79K",
+        help="HF id for CLIP processor (Flow-GRPO pickscore_scorer default).",
     )
-    p.add_argument("--pickscore_model_id", type=str, default="yuvalkirstain/PickScore_v1")
+    p.add_argument(
+        "--pickscore_model_id",
+        type=str,
+        default="yuvalkirstain/PickScore_v1",
+        help="HF id for PickScore CLIP head (Flow-GRPO default).",
+    )
     p.add_argument(
         "--pickscore_max_batch_size",
         type=int,
         default=None,
-        help="PickScore GPU micro-batch; None = whole group at once.",
+        help="GPU micro-batch for PickScore forward; None = one batch per rollout group.",
     )
-    p.add_argument("--geneval_server_url", type=str, default="http://127.0.0.1:18085")
-    p.add_argument("--geneval_only_strict", action="store_true")
+    p.add_argument(
+        "--geneval_server_url",
+        type=str,
+        default="http://127.0.0.1:18085",
+        help="Base URL of reward-server GenEval app (POST / with pickle payload; see yifan123/reward-server app_geneval.py).",
+    )
+    p.add_argument(
+        "--geneval_only_strict",
+        action="store_true",
+        help="GenEval request only_strict=True (stricter matching inside server; flow_grpo geneval config option).",
+    )
     p.add_argument(
         "--geneval_reward_field",
         type=str,
         default="score",
         choices=["score", "accuracy", "strict_accuracy"],
+        help="Which server field to use as scalar reward: score=continuous (flow_grpo default), accuracy/strict_accuracy=binary.",
     )
     p.add_argument("--geneval_timeout_sec", type=float, default=120.0)
-    p.add_argument("--geneval_max_batch_size", type=int, default=64)
+    p.add_argument(
+        "--geneval_max_batch_size",
+        type=int,
+        default=64,
+        help="Max images per HTTP request to GenEval server (group may be split).",
+    )
     p.add_argument("--geneval_max_retries", type=int, default=3)
     p.add_argument("--global_question_template_en", type=str, default=None)
     p.add_argument("--skip_vqa", action="store_true")
@@ -370,26 +469,26 @@ def parse_args():
         "--log_image_steps",
         type=int,
         default=0,
-        help="If > 0, every N global optimizer steps log per-image r_total/r_ir/r_vqa/advantage: "
-        "JSON under output_dir/rollout_samples/step_XXXXXXXX/ and TensorBoard (rollout/sample_table + rollout_log/img_XX/*). "
-        "TB root: output_dir/logs_grpo. For TB image grids, add --save_rollout_sample_images.",
+        help="If > 0, every N global optimizer steps log this rollout group's per-image r_total/r_ir/r_vqa/advantage: "
+        "JSON under output_dir/rollout_samples/step_XXXXXXXX/ and TensorBoard (rollout/sample_table text + rollout_log/img_XX/* scalars). "
+        "TB root: output_dir/logs_grpo. For image grids in TB, also pass --save_rollout_sample_images (same behavior as train_sdxl_grpo).",
     )
     p.add_argument(
         "--save_rollout_sample_images",
         action="store_true",
-        help="Requires --log_image_steps>0. Saves PNGs under rollout_samples/ and TB rollout/images + rollout/img_XX_with_metrics (cap: --max_logged_images).",
+        help="Requires --log_image_steps>0. Saves PNGs under rollout_samples/ and adds TB panels rollout/images and rollout/img_XX_with_metrics (cap: --max_logged_images).",
     )
     p.add_argument(
         "--max_logged_images",
         type=int,
         default=4,
-        help="Max images per logged step on disk and in TensorBoard when --save_rollout_sample_images is set (typically ≤ group_size).",
+        help="Max images per logged step to write to disk and to TensorBoard when --save_rollout_sample_images is set (typically ≤ group_size).",
     )
     p.add_argument(
         "--checkpointing_steps",
         type=int,
         default=0,
-        help="If > 0, save checkpoint-{step}/ (unet_lora.safetensors + training_state.pt with optimizer + resume cursor) every N global optimizer steps. 0 = disabled.",
+        help="If > 0, save checkpoint-{step}/ (transformer_lora.safetensors + training_state.pt) every N global optimizer steps. 0 = disabled.",
     )
     p.add_argument(
         "--checkpoints_total_limit",
@@ -417,16 +516,14 @@ class ResumeState:
 
 
 def load_pipeline(args, device: str, torch_dtype: torch.dtype, lora_path_override: str | None = None):
-    pipe = StableDiffusionXLPipeline.from_pretrained(
+    pipe = StableDiffusion3Pipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         torch_dtype=torch_dtype,
-        use_safetensors=True,
-        variant="fp16" if torch_dtype == torch.float16 else None,
     )
-    pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
+    pipe.scheduler = FlowMatchEulerDiscreteScheduler.from_config(pipe.scheduler.config)
     pipe = pipe.to(device)
     if args.gradient_checkpointing:
-        pipe.unet.enable_gradient_checkpointing()
+        unwrap_module(pipe.transformer).enable_gradient_checkpointing()
 
     target_modules = [
         "to_k",
@@ -440,7 +537,7 @@ def load_pipeline(args, device: str, torch_dtype: torch.dtype, lora_path_overrid
         init_lora_weights="gaussian",
         target_modules=target_modules,
     )
-    pipe.unet = get_peft_model(pipe.unet, lora_config)
+    pipe.transformer = get_peft_model(pipe.transformer, lora_config)
 
     lp = lora_path_override if lora_path_override is not None else args.lora_path
     if lp:
@@ -448,27 +545,27 @@ def load_pipeline(args, device: str, torch_dtype: torch.dtype, lora_path_overrid
             from peft import set_peft_model_state_dict
             from safetensors.torch import load_file
 
-            set_peft_model_state_dict(pipe.unet, load_file(lp))
+            set_peft_model_state_dict(pipe.transformer, load_file(lp))
         elif os.path.isdir(lp):
             pipe.load_lora_weights(lp)
         else:
             d, fn = os.path.dirname(lp) or ".", os.path.basename(lp)
             pipe.load_lora_weights(d, weight_name=fn)
 
-    if args.merge_lora_into_unet:
-        pipe.unet.merge_and_unload()
-        pipe.unet = get_peft_model(pipe.unet, lora_config)
+    if args.merge_lora_into_transformer:
+        pipe.transformer.merge_and_unload()
+        pipe.transformer = get_peft_model(pipe.transformer, lora_config)
 
     return pipe
 
 
 def stack_rollouts(results: list) -> dict:
-    """Stack list of SdxlRolloutResult (same prompt) -> tensors (G, ...)."""
+    """Stack list of Sd3RolloutResult (same prompt) -> tensors (G, ...)."""
     latents = torch.stack([r.latents_traj for r in results], dim=0)
     logp = torch.stack([r.log_probs for r in results], dim=0)
     ts = results[0].timesteps
     timesteps = ts.unsqueeze(0).expand(len(results), -1)
-    return {
+    out = {
         "latents": latents[:, :-1],
         "next_latents": latents[:, 1:],
         "log_probs": logp,
@@ -477,9 +574,13 @@ def stack_rollouts(results: list) -> dict:
         "negative_prompt_embeds": results[0].negative_prompt_embeds,
         "pooled_prompt_embeds": results[0].pooled_prompt_embeds,
         "negative_pooled_prompt_embeds": results[0].negative_pooled_prompt_embeds,
-        "add_time_ids": results[0].add_time_ids,
+        "rollout_mu": results[0].rollout_mu,
         "images": [img for r in results for img in r.images_pil],
     }
+    m0 = getattr(results[0], "sde_trainable_mask", None)
+    if m0 is not None:
+        out["sde_trainable_mask"] = m0
+    return out
 
 
 def tensor_stats_values(x: torch.Tensor) -> tuple[float, float, float, float]:
@@ -612,7 +713,12 @@ def log_run_config(tb_writer: SummaryWriter | None, args, accelerator: Accelerat
     config_scalars = {
         "config/group_size": float(args.group_size),
         "config/sample_num_steps": float(args.sample_num_steps),
-        "config/sample_eta": float(args.sample_eta),
+        "config/noise_level": float(args.noise_level),
+        "config/flow_grpo_fast": 1.0 if args.flow_grpo_fast else 0.0,
+        "config/fast_sde_window_size": float(args.fast_sde_window_size),
+        "config/fast_sde_range_lo": float(args.fast_sde_range_lo),
+        "config/fast_sde_range_hi": float(args.fast_sde_range_hi),
+        "config/max_sequence_length": float(args.max_sequence_length),
         "config/sample_guidance_scale": float(args.sample_guidance_scale),
         "config/rollout_batch_size": float(args.rollout_batch_size),
         "config/train_batch_size": float(args.train_batch_size),
@@ -639,6 +745,7 @@ def log_run_config(tb_writer: SummaryWriter | None, args, accelerator: Accelerat
     }
     for name, value in config_scalars.items():
         tb_writer.add_scalar(name, value, 0)
+    tb_writer.add_text("config/sde_type", args.sde_type, 0)
     tb_writer.add_text("config/vqa_backend", args.vqa_backend, 0)
     tb_writer.add_text("config/vqa_model", args.vqa_model, 0)
     if args.vqa_backend == "pickscore":
@@ -714,7 +821,7 @@ def setup_split_roles(args, accelerator: Accelerator) -> SplitRoleConfig:
 
 
 def optimizer_steps_per_sample(args, num_train_steps: int) -> int:
-    """DDPO inner loop: count of optimizer.step() per sample (after gradient accumulation)."""
+    """Policy-update inner loop: count of optimizer.step() per sample (after gradient accumulation)."""
     flat_n = int(args.group_size) * int(num_train_steps)
     micro = int(args.train_num_inner_epochs) * math.ceil(flat_n / max(1, int(args.train_batch_size)))
     acc = max(1, int(args.gradient_accumulation_steps))
@@ -744,11 +851,11 @@ def print_training_startup_config(
         )
     else:
         opt_epoch_line = f"  ~opt_steps/rank0/epoch:    {std_rank0_samples * steps_per_sample}"
-    eta_warn = ""
-    if float(args.sample_eta) <= 0.0:
-        eta_warn = (
-            "  WARNING: sample_eta<=0 时 DDIM 退化为确定性步，当前 log_prob 目标对 UNet 无梯度；"
-            "请使用 sample_eta>0（默认 1.0）。"
+    noise_warn = ""
+    if float(args.noise_level) <= 0.0:
+        noise_warn = (
+            "  WARNING: noise_level<=0 时官方 SDE 方差项可能退化，log_prob / 梯度可能异常；"
+            "请使用 noise_level>0（官方默认约 0.7）。"
         )
     ts_mode_warn = ""
     if args.train_timestep_unbiased_scale and args.train_timestep_sample_mode != "group_shared_uniform":
@@ -758,7 +865,7 @@ def print_training_startup_config(
         )
     lines = [
         "=" * 72,
-        "GRPO / DDPO 训练配置（启动摘要）",
+        "GRPO / Flow-GRPO（SD3）训练配置（启动摘要）",
         "=" * 72,
         f"  output_dir:              {args.output_dir}",
         f"  pretrained_model:        {args.pretrained_model_name_or_path}",
@@ -778,8 +885,16 @@ def print_training_startup_config(
         f"  resolution:              {args.resolution}",
         f"  group_size (G):          {args.group_size}",
         f"  rollout_batch_size:      {args.rollout_batch_size}",
-        f"  sample_num_steps:        {args.sample_num_steps}  eta={args.sample_eta}  guidance={args.sample_guidance_scale}",
-        *([eta_warn] if eta_warn else []),
+        f"  sample_num_steps:        {args.sample_num_steps}  noise_level={args.noise_level}  sde_type={args.sde_type}  guidance={args.sample_guidance_scale}",
+        f"  flow_grpo_fast:          {args.flow_grpo_fast}"
+        + (
+            f"  (window={args.fast_sde_window_size}, range=[{args.fast_sde_range_lo}, "
+            f"{args.fast_sde_range_hi if args.fast_sde_range_hi > 0 else 'T'}))"
+            if args.flow_grpo_fast
+            else ""
+        ),
+        f"  max_sequence_length:     {args.max_sequence_length}  train_flow_steps={getattr(args, 'train_flow_steps', None)}",
+        *([noise_warn] if noise_warn else []),
         f"  train_timestep_fraction: {args.train_timestep_fraction}  -> num_train_steps={num_train_steps}",
         f"  train_timestep_sample_mode: {args.train_timestep_sample_mode}",
         f"  train_timestep_unbiased_scale: {args.train_timestep_unbiased_scale}  (T/K loss scale only if uniform+K<T; may need LR retune)",
@@ -792,7 +907,7 @@ def print_training_startup_config(
         f"  train_learning_rate:     {args.train_learning_rate}",
         f"  gradient_checkpointing:  {bool(args.gradient_checkpointing)}",
         f"  train_cfg:               {args.train_cfg}",
-        f"  lora_rank:               {args.lora_rank}  merge_lora_into_unet={args.merge_lora_into_unet}",
+        f"  lora_rank:               {args.lora_rank}  merge_lora_into_transformer={args.merge_lora_into_transformer}",
         f"  max_samples_per_epoch:   {args.max_samples_per_epoch}",
         f"  imagereward_max_batch:   {args.imagereward_max_batch_size}",
         "-" * 72,
@@ -806,7 +921,7 @@ def print_training_startup_config(
             else f"  geneval={args.geneval_server_url} field={args.geneval_reward_field}"
             if args.vqa_backend == "geneval_remote"
             else (
-                f"  structured_VQA max_tok={args.vqa_structured_max_tokens} thinking={not args.vqa_structured_disable_thinking}"
+                f"  structured_VQA max_tok={args.vqa_structured_max_tokens} temp={args.vqa_structured_temperature} thinking={not args.vqa_structured_disable_thinking}"
                 if args.vqa_backend == "vllm_openai_structured"
                 else ""
             )
@@ -855,14 +970,10 @@ def epoch_samples_for_rank(
     return ordered[shard_idx::num_shards], dropped
 
 
-def get_unet_module(unet):
-    return unet.module if isinstance(unet, DDP) else unet
-
-
-def _ddp_no_sync_if(unet, active: bool):
+def _ddp_no_sync_if(module, active: bool):
     """Skip gradient all-reduce on DDP backward when still accumulating."""
-    if active and isinstance(unet, DDP):
-        return unet.no_sync()
+    if active and isinstance(module, DDP):
+        return module.no_sync()
     return nullcontext()
 
 
@@ -879,20 +990,20 @@ def _ddpo_subsample_loss_scale(args, num_train_steps: int) -> float:
     return 1.0
 
 
-def _trainable_grad_l2_norm(unet: torch.nn.Module) -> tuple[float, int]:
+def _trainable_grad_l2_norm(module: torch.nn.Module) -> tuple[float, int]:
     """Sum of squared grads over requires_grad parameters that received a grad this step."""
-    unet_inner = get_unet_module(unet)
+    inner = unwrap_module(module)
     total_sq = 0.0
     n = 0
-    for p in unet_inner.parameters():
+    for p in inner.parameters():
         if p.requires_grad and p.grad is not None:
             total_sq += float(p.grad.detach().float().pow(2).sum().item())
             n += 1
     return (total_sq**0.5, n)
 
 
-def trainable_params(unet) -> list[torch.nn.Parameter]:
-    return [p for p in get_unet_module(unet).parameters() if p.requires_grad]
+def trainable_params(module) -> list[torch.nn.Parameter]:
+    return [p for p in unwrap_module(module).parameters() if p.requires_grad]
 
 
 def send_tensor(tensor: torch.Tensor, dst: int) -> None:
@@ -930,8 +1041,8 @@ def recv_rollout_payload(src: int, device: torch.device) -> dict[str, torch.Tens
     return {key: recv_tensor(src, device) for key in _ROLLOUT_TENSOR_KEYS}
 
 
-def sync_trainable_params(unet, peer_rank: int, send: bool) -> None:
-    for param in trainable_params(unet):
+def sync_trainable_params(module, peer_rank: int, send: bool) -> None:
+    for param in trainable_params(module):
         if send:
             dist.send(param.data.detach().contiguous(), peer_rank)
         else:
@@ -1002,29 +1113,52 @@ def sample_ddpo_train_timestep_indices(
     mode: str,
     device: torch.device,
     seed: int,
+    allowed_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Return indices [G, K] into rollout steps 0..T-1 (latents slice)."""
-    K = min(max(K, 1), T)
+    pool_cpu: torch.Tensor | None = None
+    if allowed_mask is not None:
+        am = allowed_mask.detach().cpu().bool()
+        if int(am.numel()) != T:
+            raise ValueError(f"allowed_mask length {am.numel()} != trajectory steps T={T}")
+        pool_cpu = torch.where(am)[0].long()
+        if int(pool_cpu.numel()) == 0:
+            raise ValueError("Flow-GRPO-Fast: sde_trainable_mask has no True entries; cannot train.")
+        t_eff = int(pool_cpu.numel())
+    else:
+        t_eff = T
+
+    K = min(max(K, 1), t_eff)
     gen_cpu = torch.Generator(device="cpu")
     gen_cpu.manual_seed(int(seed) & 0x7FFF_FFFF_FFFF_FFFF)
 
-    if K >= T:
-        row = torch.randperm(T, generator=gen_cpu, device="cpu")[:K].to(device=device, dtype=torch.long)
+    def _map_row(row: torch.Tensor) -> torch.Tensor:
+        if pool_cpu is None:
+            return row.to(device=device, dtype=torch.long)
+        ix = row.detach().long().cpu()
+        return pool_cpu[ix].to(device=device, dtype=torch.long)
+
+    if K >= t_eff:
+        row = torch.randperm(t_eff, generator=gen_cpu, device="cpu")[:K]
+        row = _map_row(row)
         return row.unsqueeze(0).expand(G, -1).contiguous()
 
     if mode == "independent":
         out = torch.empty((G, K), device=device, dtype=torch.long)
         for i in range(G):
             gen_cpu.manual_seed((int(seed) + i + 1) & 0x7FFF_FFFF_FFFF_FFFF)
-            out[i] = torch.randperm(T, generator=gen_cpu, device="cpu")[:K].to(device=device, dtype=torch.long)
+            sub = torch.randperm(t_eff, generator=gen_cpu, device="cpu")[:K]
+            out[i] = _map_row(sub)
         return out
 
     if mode == "group_shared_uniform":
-        row = torch.randperm(T, generator=gen_cpu, device="cpu")[:K].to(device=device, dtype=torch.long)
+        row = torch.randperm(t_eff, generator=gen_cpu, device="cpu")[:K]
+        row = _map_row(row)
         return row.unsqueeze(0).expand(G, -1).contiguous()
 
     if mode == "group_shared_stratified":
-        row = _stratified_timestep_indices(T, K, gen_cpu, device)
+        row = _stratified_timestep_indices(t_eff, K, gen_cpu, device)
+        row = _map_row(row)
         return row.unsqueeze(0).expand(G, -1).contiguous()
 
     raise ValueError(f"Unknown train_timestep_sample_mode: {mode}")
@@ -1045,17 +1179,15 @@ def build_rollout_training_batch(
     judges = sample.judge_questions
 
     results = []
-    pipe.unet.eval()
-    rb = max(1, min(int(args.rollout_batch_size), int(args.group_size)))
-    g_cursor = 0
-    while g_cursor < args.group_size:
-        chunk = min(rb, args.group_size - g_cursor)
+    pipe.transformer.eval()
+    fast_seed = int(args.seed) + int(global_step) * 1_000_003 + _prompt_subseed(prompt)
+    if args.flow_grpo_fast:
         gens = [
-            torch.Generator(device=device).manual_seed(args.seed + global_step * 1000 + g_cursor + j)
-            for j in range(chunk)
+            torch.Generator(device=device).manual_seed(args.seed + global_step * 1000 + j)
+            for j in range(args.group_size)
         ]
         with torch.inference_mode():
-            chunk_results = sdxl_ddim_rollout_parallel(
+            results = sd3_flow_rollout_parallel(
                 pipe,
                 prompt=prompt,
                 negative_prompt=args.negative_prompt or None,
@@ -1063,13 +1195,45 @@ def build_rollout_training_batch(
                 width=args.resolution,
                 num_inference_steps=args.sample_num_steps,
                 guidance_scale=args.sample_guidance_scale,
-                eta=args.sample_eta,
-                num_parallel=chunk,
+                num_parallel=args.group_size,
                 generators=gens,
+                max_sequence_length=args.max_sequence_length,
+                noise_level=args.noise_level,
+                sde_type=args.sde_type,
                 output_type="pil",
+                flow_grpo_fast=True,
+                fast_branch_seed=fast_seed,
+                fast_sde_window_size=int(args.fast_sde_window_size),
+                fast_sde_range_lo=int(args.fast_sde_range_lo),
+                fast_sde_range_hi=int(args.fast_sde_range_hi),
             )
-        results.extend(chunk_results)
-        g_cursor += chunk
+    else:
+        rb = max(1, min(int(args.rollout_batch_size), int(args.group_size)))
+        g_cursor = 0
+        while g_cursor < args.group_size:
+            chunk = min(rb, args.group_size - g_cursor)
+            gens = [
+                torch.Generator(device=device).manual_seed(args.seed + global_step * 1000 + g_cursor + j)
+                for j in range(chunk)
+            ]
+            with torch.inference_mode():
+                chunk_results = sd3_flow_rollout_parallel(
+                    pipe,
+                    prompt=prompt,
+                    negative_prompt=args.negative_prompt or None,
+                    height=args.resolution,
+                    width=args.resolution,
+                    num_inference_steps=args.sample_num_steps,
+                    guidance_scale=args.sample_guidance_scale,
+                    num_parallel=chunk,
+                    generators=gens,
+                    max_sequence_length=args.max_sequence_length,
+                    noise_level=args.noise_level,
+                    sde_type=args.sde_type,
+                    output_type="pil",
+                )
+            results.extend(chunk_results)
+            g_cursor += chunk
 
     imgs = [r.images_pil[0] for r in results]
     prompts_g = [prompt] * args.group_size
@@ -1097,15 +1261,20 @@ def build_rollout_training_batch(
 
     stacked = stack_rollouts(results)
     G, T, _c, _h, _w = stacked["latents"].shape
-    K = min(max(num_train_steps, 1), T)
+    t_cap = min(T, int(args.train_flow_steps)) if args.train_flow_steps is not None else T
+    K = min(max(num_train_steps, 1), t_cap)
     idx_seed = int(args.seed) + int(global_step) * 1_000_003 + _prompt_subseed(prompt)
+    allowed = stacked.get("sde_trainable_mask")
+    if allowed is not None:
+        allowed = allowed.to(device=device)[:t_cap]
     idx = sample_ddpo_train_timestep_indices(
-        T=T,
+        T=t_cap,
         K=K,
         G=G,
         mode=args.train_timestep_sample_mode,
         device=device,
         seed=idx_seed,
+        allowed_mask=allowed,
     )
     rollout_sec = time.perf_counter() - rollout_start
 
@@ -1119,7 +1288,7 @@ def build_rollout_training_batch(
         "negative_prompt_embeds": stacked["negative_prompt_embeds"],
         "pooled_prompt_embeds": stacked["pooled_prompt_embeds"],
         "negative_pooled_prompt_embeds": stacked["negative_pooled_prompt_embeds"],
-        "add_time_ids": stacked["add_time_ids"],
+        "rollout_mu": stacked["rollout_mu"].to(device=device, dtype=torch.float32),
         "reward_metrics": make_rollout_metrics_tensor(
             r_total=r_total,
             r_ir_t=r_ir_t,
@@ -1327,7 +1496,7 @@ def log_rollout_sample_image_files(
             )
 
 
-def run_ddpo_update(
+def run_flow_grpo_update(
     pipe,
     optimizer,
     batch: dict[str, torch.Tensor],
@@ -1347,9 +1516,13 @@ def run_ddpo_update(
 
     G, num_train_steps, c, h, w = latents_b.shape
     # Split infer/train: train ranks never run rollout, so scheduler is unset; align with infer side.
-    ensure_ddim_scheduler(pipe)
-    pipe.scheduler.set_timesteps(args.sample_num_steps, device=device)
-    pipe.unet.train()
+    ensure_flow_match_scheduler(pipe)
+    mu_t = batch["rollout_mu"]
+    if pipe.scheduler.config.get("use_dynamic_shifting", False):
+        retrieve_timesteps(pipe.scheduler, args.sample_num_steps, device, mu=float(mu_t[0].item()))
+    else:
+        pipe.scheduler.set_timesteps(args.sample_num_steps, device=device)
+    pipe.transformer.train()
     autocast_cm = (
         torch.autocast(device_type="cuda", dtype=torch_dtype)
         if device.type == "cuda"
@@ -1387,9 +1560,9 @@ def run_ddpo_update(
             micro_idx += 1
             micro_batch_count += 1
             end = min(start + args.train_batch_size, n)
-            accum_cm = accelerator.accumulate(pipe.unet) if accelerator is not None else nullcontext()
+            accum_cm = accelerator.accumulate(pipe.transformer) if accelerator is not None else nullcontext()
             with accum_cm:
-                loss, approx_kl, clipfrac = sdxl_ddpo_calculate_loss(
+                loss, approx_kl, clipfrac = sd3_flow_grpo_calculate_loss(
                     pipe,
                     flat_lat[start:end],
                     flat_time[start:end],
@@ -1400,12 +1573,12 @@ def run_ddpo_update(
                     batch["negative_prompt_embeds"],
                     batch["pooled_prompt_embeds"],
                     batch["negative_pooled_prompt_embeds"],
-                    batch["add_time_ids"],
                     args.sample_guidance_scale,
                     args.train_cfg,
                     args.train_clip_range,
                     args.train_adv_clip_max,
-                    args.sample_eta,
+                    args.noise_level,
+                    args.sde_type,
                     autocast_cm,
                 )
                 loss = loss * ddpo_scale
@@ -1413,15 +1586,15 @@ def run_ddpo_update(
                 if accelerator is None:
                     loss_scaled = loss / acc_steps
                     should_sync_step = (micro_idx % acc_steps == 0) or (micro_idx == total_micro_batches)
-                    with _ddp_no_sync_if(pipe.unet, acc_steps > 1 and not should_sync_step):
+                    with _ddp_no_sync_if(pipe.transformer, acc_steps > 1 and not should_sync_step):
                         loss_scaled.backward()
                     if grad_trace is not None and not grad_trace.get("logged_grad"):
-                        gnorm, gcnt = _trainable_grad_l2_norm(pipe.unet)
+                        gnorm, gcnt = _trainable_grad_l2_norm(pipe.transformer)
                         grad_trace["logged_grad"] = True
                         if gcnt == 0:
                             logger.warning(
-                                "首次 backward 后没有任何可训练参数的 grad（LoRA 可能未接入计算图，或 loss 与 UNet 已断开）。"
-                                "loss=%.6e 若长期如此请检查 sample_eta>0、advantage 是否全 0。",
+                                "首次 backward 后没有任何可训练参数的 grad（LoRA 可能未接入计算图，或 loss 与 transformer 已断开）。"
+                                "loss=%.6e 若长期如此请检查 noise_level>0、advantage 是否全 0。",
                                 float(loss.detach().item()),
                             )
                         else:
@@ -1438,12 +1611,12 @@ def run_ddpo_update(
                 else:
                     backward_fn(loss)
                     if grad_trace is not None and not grad_trace.get("logged_grad"):
-                        gnorm, gcnt = _trainable_grad_l2_norm(pipe.unet)
+                        gnorm, gcnt = _trainable_grad_l2_norm(pipe.transformer)
                         grad_trace["logged_grad"] = True
                         if gcnt == 0:
                             logger.warning(
-                                "首次 backward 后没有任何可训练参数的 grad（LoRA 可能未接入计算图，或 loss 与 UNet 已断开）。"
-                                "loss=%.6e 若长期如此请检查 sample_eta>0、advantage 是否全 0。",
+                                "首次 backward 后没有任何可训练参数的 grad（LoRA 可能未接入计算图，或 loss 与 transformer 已断开）。"
+                                "loss=%.6e 若长期如此请检查 noise_level>0、advantage 是否全 0。",
                                 float(loss.detach().item()),
                             )
                         else:
@@ -1480,15 +1653,15 @@ def run_ddpo_update(
 
 def save_lora(path: Path, pipe, accelerator: Accelerator):
     path.mkdir(parents=True, exist_ok=True)
-    raw = pipe.unet
+    raw = pipe.transformer
     if isinstance(raw, DDP):
-        unet = get_unet_module(raw)
+        tr = unwrap_module(raw)
     else:
-        unet = get_unet_module(accelerator.unwrap_model(raw))
-    state_dict = get_peft_model_state_dict(unet)
+        tr = unwrap_module(accelerator.unwrap_model(raw))
+    state_dict = get_peft_model_state_dict(tr)
     from safetensors.torch import save_file
 
-    save_file(state_dict, path / "unet_lora.safetensors")
+    save_file(state_dict, path / "transformer_lora.safetensors")
     logger.info("Saved LoRA to %s", path)
 
 
@@ -1558,7 +1731,7 @@ def save_training_checkpoint(
     epoch: int,
     next_sample_idx_in_epoch: int,
 ) -> None:
-    """unet_lora.safetensors + training_state.pt (optimizer + resume cursor)."""
+    """transformer_lora.safetensors + training_state.pt (optimizer + resume cursor)."""
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     save_lora(ckpt_dir, pipe, accelerator)
     torch.save(
@@ -1591,9 +1764,9 @@ def run_standard_training(
     if accelerator.num_processes > 1:
         samples = samples[accelerator.process_index :: accelerator.num_processes]
 
-    trainable = trainable_params(pipe.unet)
+    trainable = trainable_params(pipe.transformer)
     optimizer = torch.optim.AdamW(trainable, lr=args.train_learning_rate)
-    pipe.unet, optimizer = accelerator.prepare(pipe.unet, optimizer)
+    pipe.transformer, optimizer = accelerator.prepare(pipe.transformer, optimizer)
     if resume is not None:
         optimizer.load_state_dict(resume.optimizer_state)
         logger.info(
@@ -1646,7 +1819,7 @@ def run_standard_training(
             roll_r_ir = batch.pop("rollout_r_ir")
             roll_r_vqa = batch.pop("rollout_r_vqa")
 
-            updates, train_metrics = run_ddpo_update(
+            updates, train_metrics = run_flow_grpo_update(
                 pipe=pipe,
                 optimizer=optimizer,
                 batch=batch,
@@ -1760,13 +1933,13 @@ def run_split_training(
     optimizer = None
     if split_cfg.is_train_rank:
         ddp_dev = [torch.cuda.current_device()] if device.type == "cuda" else None
-        pipe.unet = DDP(
-            pipe.unet,
+        pipe.transformer = DDP(
+            pipe.transformer,
             device_ids=ddp_dev,
             process_group=split_cfg.train_group,
             broadcast_buffers=False,
         )
-        optimizer = torch.optim.AdamW(trainable_params(pipe.unet), lr=args.train_learning_rate)
+        optimizer = torch.optim.AdamW(trainable_params(pipe.transformer), lr=args.train_learning_rate)
         if resume is not None:
             optimizer.load_state_dict(resume.optimizer_state)
             if split_cfg.is_train_main:
@@ -1854,7 +2027,7 @@ def run_split_training(
                 payload.pop("images_pil")
                 payload.pop("prompt_text")
                 send_rollout_payload(payload, split_cfg.pair_rank)
-                sync_trainable_params(pipe.unet, split_cfg.pair_rank, send=False)
+                sync_trainable_params(pipe.transformer, split_cfg.pair_rank, send=False)
                 global_step += updates_per_sample
                 infer_pbar.update(updates_per_sample)
                 infer_pbar.set_postfix(gstep=global_step, refresh=True)
@@ -1868,7 +2041,7 @@ def run_split_training(
             roll_r_ir = payload.pop("rollout_r_ir")
             roll_r_vqa = payload.pop("rollout_r_vqa")
             reward_metrics = payload.pop("reward_metrics")
-            updates, train_metrics = run_ddpo_update(
+            updates, train_metrics = run_flow_grpo_update(
                 pipe=pipe,
                 optimizer=optimizer,
                 batch=payload,
@@ -1943,7 +2116,7 @@ def run_split_training(
                             advantages=payload["advantages"],
                         )
 
-            sync_trainable_params(pipe.unet, split_cfg.pair_rank, send=True)
+            sync_trainable_params(pipe.transformer, split_cfg.pair_rank, send=True)
 
             if (
                 updates > 0
@@ -2012,7 +2185,7 @@ def main():
     if args.resume_from_checkpoint:
         resume_ckpt_dir = resolve_resume_checkpoint_dir(out_dir, args.resume_from_checkpoint)
         resume_state = load_resume_state_from_dir(resume_ckpt_dir)
-        lora_file = resume_ckpt_dir / "unet_lora.safetensors"
+        lora_file = resume_ckpt_dir / "transformer_lora.safetensors"
         if not lora_file.is_file():
             raise FileNotFoundError(f"Resume directory missing LoRA weights: {lora_file}")
 
@@ -2021,18 +2194,22 @@ def main():
     tb_writer = SummaryWriter(log_dir=str(tb_dir)) if should_write_tb else None
     log_run_config(tb_writer, args, accelerator, split_cfg)
 
-    lora_ckpt = str(resume_ckpt_dir / "unet_lora.safetensors") if resume_ckpt_dir else None
+    lora_ckpt = str(resume_ckpt_dir / "transformer_lora.safetensors") if resume_ckpt_dir else None
     pipe = load_pipeline(args, str(device), torch_dtype, lora_path_override=lora_ckpt)
     accelerator.wait_for_everyone()
     pipe.vae.requires_grad_(False)
     pipe.text_encoder.requires_grad_(False)
     if pipe.text_encoder_2 is not None:
         pipe.text_encoder_2.requires_grad_(False)
+    if pipe.text_encoder_3 is not None:
+        pipe.text_encoder_3.requires_grad_(False)
     if split_cfg.is_train_rank:
         pipe.vae.to("cpu")
         pipe.text_encoder.to("cpu")
         if pipe.text_encoder_2 is not None:
             pipe.text_encoder_2.to("cpu")
+        if pipe.text_encoder_3 is not None:
+            pipe.text_encoder_3.to("cpu")
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
@@ -2119,7 +2296,12 @@ def main():
     samples = list_grpo_jsonl(args.grpo_jsonl, prompt_field=args.prompt_field, max_samples=args.max_samples_per_epoch)
     if not samples:
         raise RuntimeError("No samples loaded from JSONL")
-    num_train_steps = max(1, int(args.sample_num_steps * args.train_timestep_fraction))
+    _t_cap = (
+        min(int(args.sample_num_steps), int(args.train_flow_steps))
+        if args.train_flow_steps is not None
+        else int(args.sample_num_steps)
+    )
+    num_train_steps = max(1, int(_t_cap * args.train_timestep_fraction))
     print_training_startup_config(
         args=args,
         accelerator=accelerator,
